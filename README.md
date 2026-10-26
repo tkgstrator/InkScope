@@ -20,11 +20,11 @@ dist/inkscope inspect "$HOME/captures/capture.pcap" \
   --target-mac 02:00:00:00:00:01
 ~~~
 
-リピーターハブに接続した有線 NIC から保存しながら解析する場合（macOS の例）:
+macOS では、初回に `brew install --cask wireshark-chmodbpf` を実行して再起動すると、通常ユーザーで BPF にアクセスできます。インストール時には管理者認証が必要です。リピーターハブに接続した有線 NIC から保存しながら解析する例:
 
 ~~~sh
 mkdir -p "$HOME/captures"
-sudo dist/inkscope capture --interface en18 \
+dist/inkscope capture --interface en18 \
   --output "$HOME/captures/capture.pcap" \
   --random-table "$HOME/.config/inkscope/table.bin" \
   --target-mac 02:00:00:00:00:01
@@ -60,24 +60,11 @@ sudo dist/inkscope capture --interface en18 \
 
 | OS | 外部ツール | インターフェース一覧と権限 |
 | --- | --- | --- |
-| macOS | `/usr/sbin/tcpdump` | `ifconfig -l` で一覧表示。BPF デバイスへの権限が必要。初回設定に [Wireshark の ChmodBPF](https://www.wireshark.org/docs/wsug_html_chunked/ChBuildInstallOSXInstall.html)を利用できる |
+| macOS | `/usr/sbin/tcpdump` | `ifconfig -l` で一覧表示。通常ユーザーでの取得には [ChmodBPF](https://formulae.brew.sh/cask/wireshark-chmodbpf) の初回設定が必要 |
 | Linux | `/usr/sbin/tcpdump` または `/usr/bin/tcpdump` | `tcpdump -D` で一覧表示。キャプチャ権限が必要。例えば tcpdump に必要な Linux capabilities を管理者が設定する |
 | Windows | `%ProgramFiles%\Wireshark\dumpcap.exe` または `%ProgramFiles(x86)%\Wireshark\dumpcap.exe` | `dumpcap -D` で一覧表示。Wireshark と Npcap のインストール、および Npcap で許可されたキャプチャ権限が必要。番号またはデバイス名を `--interface` に指定する。ポータブル版や別の場所へのインストールは現状検出しない |
 
 例えば Linux では `inkscope capture --interface eth0 --output capture.pcap --random-table table.bin`、Windows では `inkscope.exe capture --interface 1 --output capture.pcap --random-table table.bin` と実行できます。[Docker Desktop のホストネットワーク](https://docs.docker.com/engine/network/drivers/host/)は物理 NIC にパケット層でアクセスできず、distroless 実行イメージにもキャプチャツールはないため、Docker イメージは保存済み PCAP の `inspect` 用です。
-
-macOS で権限設定を変えずに InkScope 本体だけを一般ユーザーで動かす場合は、`tcpdump` だけを `sudo` で起動できます。上の `sudo dist/inkscope capture` では保存した PCAP の所有者も root になります。
-
-~~~sh
-mkdir -p "$HOME/captures"
-PCAP="$(mktemp "$HOME/captures/inkscope.XXXXXX")"
-sudo /usr/sbin/tcpdump -i en18 -s 0 -U -w - \
-  'udp and (port 35000 or port 49152)' |
-  tee "$PCAP" |
-  dist/inkscope inspect /dev/stdin \
-    --random-table "$HOME/.config/inkscope/table.bin" \
-    --target-mac 02:00:00:00:00:01
-~~~
 
 ## WAVE 先読み
 
