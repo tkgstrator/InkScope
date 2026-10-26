@@ -1,5 +1,5 @@
 [package]
-name = "s3-packet-capture"
+name = "inkscope"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
@@ -20,7 +20,7 @@ sha2 = "0.10"
 zstd = "0.13.3"
 zstd-safe = "7.3"
 zeroize = "1.9.1"
-salmon-wave-lookahead = { path = "../wave-lookahead" }
+ocean-calc = { path = "../ocean-calc" }
 
 [dev-dependencies]
 tempfile = "3"

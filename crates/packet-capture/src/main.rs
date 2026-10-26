@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use s3_packet_capture::Result;
-use s3_packet_capture::crypto::{self, GameKey, PiaKey};
-use s3_packet_capture::decode::Decoder;
-use s3_packet_capture::pcap::{Reader, UdpPacket};
-use s3_packet_capture::preview::WavePreviewer;
-use s3_packet_capture::render::print_row;
+use inkscope::Result;
+use inkscope::crypto::{self, GameKey, PiaKey};
+use inkscope::decode::Decoder;
+use inkscope::pcap::{Reader, UdpPacket};
+use inkscope::preview::WavePreviewer;
+use inkscope::render::print_row;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
@@ -18,8 +18,8 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
-    name = "s3-packet-capture",
-    about = "Splatoon 3 11.3.0 LAN Play packet capture and authenticated decoder"
+    name = "inkscope",
+    about = "Splatoon 3 LAN Play packet capture and decoder"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -487,7 +487,7 @@ fn run() -> Result<()> {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("s3-packet-capture: {error}");
+        eprintln!("inkscope: {error}");
         std::process::exit(1);
     }
 }

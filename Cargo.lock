@@ -560,7 +560,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "s3-packet-capture"
+name = "inkscope"
 version = "0.1.0"
 dependencies = [
  "aes",
@@ -571,7 +571,7 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
- "salmon-wave-lookahead",
+ "ocean-calc",
  "serde",
  "serde_json",
  "sha2",
@@ -582,7 +582,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "salmon-wave-lookahead"
+name = "ocean-calc"
 version = "0.1.0"
 
 [[package]]

@@ -1,0 +1,15 @@
+[package]
+name = "ocean-calc"
+version = "0.1.0"
+edition = "2024"
+description = "Offline, evidence-scoped Splatoon 3 Salmon Run wave calculations"
+license = "MIT"
+publish = false
+
+[lib]
+name = "ocean_calc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ocean-calc"
+path = "src/main.rs"

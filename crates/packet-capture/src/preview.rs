@@ -5,7 +5,7 @@
 //! applied without later overrides.
 
 use crate::decode::Row;
-use salmon_wave_lookahead::{
+use ocean_calc::{
     SeedWords,
     levels::{common_weights, queue_counts},
     records::{NormalWaveInput, predict_selections},

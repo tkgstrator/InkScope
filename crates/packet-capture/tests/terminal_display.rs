@@ -40,7 +40,7 @@ fn terminal_uses_iso_utc_and_omits_endpoints_while_jsonl_retains_them() {
     let pcap = dir.path().join("one.pcap");
     fs::write(&pcap, one_packet_pcap()).unwrap();
     let run = |jsonl: bool| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_s3-packet-capture"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_inkscope"));
         command
             .arg("inspect")
             .arg(&pcap)
