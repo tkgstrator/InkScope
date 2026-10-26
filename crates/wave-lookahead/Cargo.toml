@@ -1,0 +1,15 @@
+[package]
+name = "salmon-wave-lookahead"
+version = "0.1.0"
+edition = "2024"
+description = "Offline, evidence-scoped Splatoon 3 Salmon Run wave calculations"
+license = "MIT"
+publish = false
+
+[lib]
+name = "salmon_wave_lookahead"
+path = "src/lib.rs"
+
+[[bin]]
+name = "salmon-wave-lookahead"
+path = "src/main.rs"
