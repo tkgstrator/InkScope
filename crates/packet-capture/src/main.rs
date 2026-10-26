@@ -1,3 +1,5 @@
+mod capture_backend;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use inkscope::Result;
 use inkscope::crypto::{self, GameKey, PiaKey};
@@ -9,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -105,16 +107,19 @@ enum DisplayMode {
 enum Mode {
     /// Extract private key-generation material from the exact pinned ELF.
     ExportTable {
-        #[arg(long)]
+        #[arg(long, help = "New output path for the private 272-byte random table")]
         output: PathBuf,
     },
     /// Decode an existing classic PCAP without network I/O.
-    Inspect { pcap: PathBuf },
-    /// Capture through tcpdump, save exact PCAP bytes, and decode live.
+    Inspect {
+        #[arg(help = "Existing classic PCAP path")]
+        pcap: PathBuf,
+    },
+    /// Capture from a host interface, save classic PCAP bytes, and decode live.
     Capture {
-        #[arg(long)]
+        #[arg(long, help = "Interface name (or dumpcap -D number on Windows)")]
         interface: String,
-        #[arg(long)]
+        #[arg(long, help = "New classic PCAP output path")]
         output: PathBuf,
     },
 }
@@ -265,37 +270,19 @@ impl<R: Read, W: Write> Read for Tee<R, W> {
     }
 }
 
-struct ChildGuard(Option<Child>);
-struct SignalPid(Arc<Mutex<Option<i32>>>);
-impl Drop for SignalPid {
-    fn drop(&mut self) {
-        if let Ok(mut pid) = self.0.lock() {
-            *pid = None;
-        }
-    }
-}
+struct ChildGuard(Arc<Mutex<Child>>);
 impl ChildGuard {
-    fn try_wait(&mut self, signal_pid: &SignalPid) -> Result<Option<std::process::ExitStatus>> {
-        let mut pid = signal_pid
-            .0
+    fn try_wait(&self) -> Result<Option<std::process::ExitStatus>> {
+        self.0
             .lock()
-            .map_err(|_| "capture signal lock poisoned")?;
-        let active = pid.take();
-        let result = self
-            .0
-            .as_mut()
-            .ok_or("capture child missing")?
+            .map_err(|_| "capture child lock poisoned")?
             .try_wait()
-            .map_err(|e| format!("tcpdump wait: {e}"));
-        if matches!(result, Ok(None)) {
-            *pid = active;
-        }
-        result
+            .map_err(|e| format!("capture wait: {e}"))
     }
 
-    fn wait(&mut self, signal_pid: &SignalPid) -> Result<std::process::ExitStatus> {
+    fn wait(&self) -> Result<std::process::ExitStatus> {
         loop {
-            if let Some(status) = self.try_wait(signal_pid)? {
+            if let Some(status) = self.try_wait()? {
                 return Ok(status);
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -304,7 +291,7 @@ impl ChildGuard {
 }
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(child) = &mut self.0
+        if let Ok(mut child) = self.0.lock()
             && child.try_wait().ok().flatten().is_none()
         {
             let _ = child.kill();
@@ -313,24 +300,27 @@ impl Drop for ChildGuard {
     }
 }
 
-fn validate_interface(interface: &str) -> Result<()> {
-    if interface.is_empty()
-        || interface.starts_with('-')
-        || interface.len() > 64
-        || !interface
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+fn stop_child(child: &mut Child, repeated: bool) {
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(
+            child.id() as i32,
+            if repeated {
+                libc::SIGKILL
+            } else {
+                libc::SIGINT
+            },
+        );
+    }
+    #[cfg(windows)]
     {
-        return Err("interface name invalid".into());
+        if repeated {
+            let _ = child.kill();
+        }
     }
-    let output = Command::new("/sbin/ifconfig")
-        .arg(interface)
-        .output()
-        .map_err(|e| format!("ifconfig: {e}"))?;
-    if !output.status.success() {
-        return Err("capture interface unavailable".into());
-    }
-    Ok(())
 }
 
 fn private_output(path: &Path) -> Result<File> {
@@ -353,52 +343,44 @@ fn capture(
     interface: &str,
     output: &Path,
 ) -> Result<()> {
-    validate_interface(interface)?;
+    let (mut command, tool_name) = capture_backend::host_command(interface)?;
     let file = private_output(output)?;
-    let child = Command::new("/usr/sbin/tcpdump")
-        .args([
-            "-i",
-            interface,
-            "-s",
-            "0",
-            "-U",
-            "-w",
-            "-",
-            "udp and (port 35000 or port 49152)",
-        ])
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn();
-    let child = match child {
+    let mut child = match child {
         Ok(child) => child,
         Err(error) => {
             drop(file);
             let _ = std::fs::remove_file(output);
-            return Err(format!("tcpdump start: {error}"));
+            return Err(format!("{tool_name} start: {error}"));
         },
     };
-    let mut guard = ChildGuard(Some(child));
-    let pid = Arc::new(Mutex::new(Some(guard.0.as_ref().unwrap().id() as i32)));
-    let _pid_guard = SignalPid(pid.clone());
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("capture tool stdout unavailable")?;
+    let guard = ChildGuard(Arc::new(Mutex::new(child)));
     let stopped = Arc::new(AtomicBool::new(false));
     let flag = stopped.clone();
-    let signal_pid = pid.clone();
+    let signal_child = guard.0.clone();
     let handler = ctrlc::set_handler(move || {
         let repeated = flag.swap(true, Ordering::SeqCst);
-        #[cfg(unix)]
-        if let Ok(child_pid) = signal_pid.lock()
-            && let Some(child_pid) = *child_pid
-        {
-            unsafe {
-                libc::kill(
-                    child_pid,
-                    if repeated {
-                        libc::SIGKILL
-                    } else {
-                        libc::SIGINT
-                    },
-                );
-            }
+        if let Ok(mut child) = signal_child.lock() {
+            stop_child(&mut child, repeated);
+        }
+        #[cfg(windows)]
+        if !repeated {
+            let timed_child = signal_child.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                if let Ok(mut child) = timed_child.lock()
+                    && matches!(child.try_wait(), Ok(None))
+                {
+                    let _ = child.kill();
+                }
+            });
         }
     });
     if let Err(error) = handler {
@@ -406,13 +388,6 @@ fn capture(
         let _ = std::fs::remove_file(output);
         return Err(format!("capture signal handler: {error}"));
     }
-    let stdout = guard
-        .0
-        .as_mut()
-        .unwrap()
-        .stdout
-        .take()
-        .ok_or("tcpdump stdout unavailable")?;
     let result = process(
         Tee {
             source: stdout,
@@ -423,32 +398,64 @@ fn capture(
         target,
     );
     if let Err(error) = result {
-        // tcpdump may close its pipe just before its exit status becomes
+        // The capture tool may close its pipe just before its exit status becomes
         // visible. Give an early startup failure (such as BPF permission
         // denial) a brief chance to report its actual status.
-        let mut child_status = guard.try_wait(&_pid_guard).ok().flatten();
+        let mut child_status = guard.try_wait().ok().flatten();
         for _ in 0..3 {
             if child_status.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
-            child_status = guard.try_wait(&_pid_guard).ok().flatten();
+            child_status = guard.try_wait().ok().flatten();
         }
-        if std::fs::metadata(output).is_ok_and(|metadata| metadata.len() == 0) {
-            let _ = std::fs::remove_file(output);
+        if error.contains("truncated PCAP record") && !stopped.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100));
         }
+        let output_len = std::fs::metadata(output)
+            .map(|metadata| metadata.len())
+            .ok();
+        let header_error = [
+            "empty PCAP",
+            "truncated PCAP record",
+            "pcapng is unsupported",
+            "invalid classic PCAP magic",
+            "unsupported PCAP version",
+            "unsupported PCAP link type",
+            "PCAP snaplen outside supported bounds",
+        ]
+        .iter()
+        .any(|message| error.starts_with(message));
+        let remove_invalid =
+            output_len.is_some_and(|length| length < 24 || length == 24 && header_error);
+        let removed = remove_invalid && std::fs::remove_file(output).is_ok();
+        if stopped.load(Ordering::SeqCst) && error.contains("truncated PCAP record") {
+            if output_len.is_none_or(|length| length < 24) {
+                return Err("capture stopped before a complete PCAP header".into());
+            }
+            eprintln!("capture stopped; saved PCAP may be partial: {error}");
+            eprintln!("PCAP saved: {}", output.display());
+            return Ok(());
+        }
+        let file_note = if removed {
+            "no PCAP saved".to_owned()
+        } else {
+            format!("PCAP saved at {}; it may be partial", output.display())
+        };
         return Err(match child_status {
-            Some(status) if !status.success() => {
-                format!("tcpdump exited with {status}; see its error above ({error})")
+            Some(status) => {
+                format!("{tool_name} exited with {status}; decode failed: {error}; {file_note}")
             },
-            Some(status) => format!("tcpdump exited with {status}; decode failed: {error}"),
-            None => format!("capture decode failed: {error}; saved PCAP may be partial"),
+            None => format!("capture decode failed: {error}; {file_note}"),
         });
     }
-    let status = guard.wait(&_pid_guard)?;
+    let status = guard.wait()?;
+    if !status.success() && !stopped.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
     if !status.success() && !stopped.load(Ordering::SeqCst) {
         return Err(format!(
-            "tcpdump exited with {status}; saved PCAP may be partial"
+            "{tool_name} exited with {status}; saved PCAP may be partial"
         ));
     }
     if !status.success() {
@@ -493,70 +500,5 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn arrows_are_relative_to_the_explicit_target() {
-        let target_mac = parse_mac("02:00:00:00:00:01").unwrap();
-        assert_eq!(target_mac, [0x02, 0, 0, 0, 0, 1]);
-        assert!(parse_mac("02:00:00:00:00").is_err());
-        assert!(parse_mac("02:00:00:00:00:gg").is_err());
-        let mut packet = UdpPacket {
-            record: 1,
-            timestamp_ns: 0,
-            source: Ipv4Addr::new(192, 0, 2, 1),
-            destination: Ipv4Addr::new(192, 0, 2, 2),
-            source_port: 49152,
-            destination_port: 49152,
-            source_mac: target_mac,
-            destination_mac: [1; 6],
-            payload: vec![],
-        };
-        assert_eq!(direction(&packet, &Target::Mac(target_mac)), "->");
-        assert_eq!(direction(&packet, &Target::Ip(packet.destination)), "<-");
-        packet.source_mac = [1; 6];
-        packet.destination_mac = target_mac;
-        assert_eq!(direction(&packet, &Target::Mac(target_mac)), "<-");
-        packet.destination_mac = [2; 6];
-        assert_eq!(direction(&packet, &Target::Mac(target_mac)), "--");
-    }
-
-    struct OneByte(Cursor<Vec<u8>>);
-    impl Read for OneByte {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let count = buf.len().min(1);
-            self.0.read(&mut buf[..count])
-        }
-    }
-
-    #[test]
-    fn tee_saves_exact_stream_despite_partial_reads() {
-        let payload = b"pcap stream in small chunks".to_vec();
-        let mut tee = Tee {
-            source: OneByte(Cursor::new(payload.clone())),
-            sink: Vec::new(),
-        };
-        let mut decoded = vec![];
-        tee.read_to_end(&mut decoded).unwrap();
-        assert_eq!(decoded, payload);
-        assert_eq!(tee.sink, payload);
-    }
-
-    #[test]
-    fn capture_output_is_private_and_never_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("capture.pcap");
-        private_output(&path).unwrap();
-        assert!(private_output(&path).is_err());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-}
+#[path = "../test_support/unit/main.rs"]
+mod tests;

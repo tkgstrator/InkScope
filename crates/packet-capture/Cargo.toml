@@ -13,7 +13,6 @@ chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 ctrlc = { version = "3.4", features = ["termination"] }
 hex = "0.4"
 hmac = "0.12"
-libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -21,6 +20,9 @@ zstd = "0.13.3"
 zstd-safe = "7.3"
 zeroize = "1.9.1"
 ocean-calc = { path = "../ocean-calc" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

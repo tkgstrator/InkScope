@@ -2,7 +2,7 @@
 
 This Rust crate implements only the parts of the Splatoon 3 **11.3.0** Salmon Run wave algorithm supported by static analysis of the owned executable and RomFS.
 
-JobType 0/1 below describes the integrated ordinary path, not the complete JobType enum. The low-level record selector also models the no-special-state JobType 2/3 branch and the ordinary generated event/tide branch for an observed live JobType 4 mode object. The historical `thunder_scenario_generator` enum defines Regular=0, Private=1, TeamContest=2, Contest=3, and BigRun=4; the 11.3.0 executable has additional mode-dependent handling and distinct branches for values 6 and 7. The selected private scenario's actual value has not been observed.
+JobType 0/1 below describes the integrated ordinary path, not the complete JobType enum. The labels used here for values 0–4 are Regular, Private, TeamContest, Contest, and BigRun. The low-level record selector also models the no-special-state JobType 2/3 branch and the ordinary generated event/tide branch for an observed live JobType 4 mode object. The 11.3.0 executable has additional mode-dependent handling and distinct branches for values 6 and 7. The selected private scenario's actual value has not been observed.
 
 For JobType 1, the library now conditionally predicts four special-weapon IDs by internal player index. It uses the private equipment subtype, its own RNG domain, the effective Common candidates and asset lookups, and the optional main-weapon remap. The caller must establish the live scene seed, selected branch value, candidate/lookup state, and remap inputs. The selected scenario seed has not been proven equal to the live scene seed, and internal player index has not been mapped to room join order or a network field. The JobType 1 five-row main-weapon builder is modeled separately and requires confirmed builder invocation plus effective scene ring, two pools, mode, and post-special RNG state.
 
@@ -100,7 +100,7 @@ For `waves`, the arguments after the four scene words are the exact loaded `Cop_
 
 The single-queue CLI header labels its branch as an assumption. The difficulty form labels its difficulty as caller supplied. The other calculations are available through the library and require explicit runtime inputs. The CLI does not decode a packet, assign final weapons, or calculate final spawn coordinates. The species selector is conditional on its supplied candidates and RNG state; it does not predict every later boss. A four-word seed alone is insufficient for those results. The implementation has fixed vectors derived from the 11.3.0 disassembly and library fixtures. A private-job gameplay capture now exists, but its scene seed, applied WAVE fields and enemy event coordinates have not yet been matched to this CLI's inputs and outputs.
 
-Source evidence was recorded in the NXCTF research workspace. This standalone repository includes no private ELF, RomFS packs, or PCAP.
+This standalone repository includes no private ELF, RomFS packs, or PCAP.
 
 The generated stage snapshot is embedded in `src/stage_data_generated.rs`. The crate has no runtime asset or Python dependency; regeneration from owned RomFS packs is outside this standalone repository.
 
