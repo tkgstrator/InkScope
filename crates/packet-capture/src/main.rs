@@ -1,4 +1,6 @@
 mod capture_backend;
+mod control;
+mod visualizer;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use inkscope::Result;
@@ -81,7 +83,7 @@ struct Cli {
     target_ip: Option<Ipv4Addr>,
     #[arg(long, global = true, help = "Print one JSON object per row")]
     jsonl: bool,
-    #[arg(long, global = true, value_enum, default_value_t = DisplayMode::Normal, help = "Display mode: normal hides Empty, BroadcastReliableProtocol, and untyped UnreliableProtocol")]
+    #[arg(long, global = true, value_enum, default_value_t = DisplayMode::Normal, help = "Display mode: normal hides Empty, generic BroadcastReliableProtocol, and untyped UnreliableProtocol; recognized PrivateSetting stays visible")]
     mode: DisplayMode,
     #[arg(
         long,
@@ -92,9 +94,15 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Hide repetitive RTT and unconfirmed Protocol 5 rows"
+        help = "Hide RTT requests and unmatched responses plus unconfirmed Protocol 5 rows; matched delay responses stay visible"
     )]
     hide_cycle: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Send capture events to a loopback InkScope Visualizer WebSocket; token comes from INKSCOPE_VISUALIZER_TOKEN"
+    )]
+    visualizer_url: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -121,6 +129,11 @@ enum Mode {
         interface: String,
         #[arg(long, help = "New classic PCAP output path")]
         output: PathBuf,
+        #[arg(
+            long,
+            help = "Optional 127.0.0.1 control HTTP port; requires INKSCOPE_CONTROL_TOKEN"
+        )]
+        control_port: Option<u16>,
     },
 }
 
@@ -150,6 +163,20 @@ fn target(cli: &Cli) -> Result<Option<Target>> {
     }
 }
 
+fn startup_key_source(cli: &Cli) -> Option<&'static str> {
+    if cli.random_table.is_some() {
+        Some("random_table")
+    } else if cli.game_key.is_some() {
+        Some("cli")
+    } else if cli.game_key_file.is_some() {
+        Some("file")
+    } else if cli.elf.is_some() {
+        Some("elf")
+    } else {
+        None
+    }
+}
+
 fn direction(packet: &UdpPacket, target: &Target) -> &'static str {
     let (source, destination) = match target {
         Target::Mac(mac) => (packet.source_mac == *mac, packet.destination_mac == *mac),
@@ -173,7 +200,15 @@ fn decoder(cli: &Cli) -> Result<Decoder> {
     .into_iter()
     .filter(|present| *present)
     .count();
-    if source_count != 1 {
+    let keyless_control_capture = source_count == 0
+        && matches!(
+            cli.command,
+            Mode::Capture {
+                control_port: Some(_),
+                ..
+            }
+        );
+    if source_count != 1 && !keyless_control_capture {
         return Err(
             "specify exactly one of --random-table, --game-key, --game-key-file, or --elf".into(),
         );
@@ -188,7 +223,7 @@ fn decoder(cli: &Cli) -> Result<Decoder> {
     } else if let Some(path) = &cli.elf {
         Some(crypto::derive_game_key(path)?)
     } else {
-        unreachable!("source count was checked")
+        None
     };
     let pia: Option<(Ipv4Addr, PiaKey)> = match (&cli.pia_key_file, cli.peer) {
         (Some(path), Some(peer)) => Some((peer, crypto::read_pia_key(path)?)),
@@ -198,11 +233,33 @@ fn decoder(cli: &Cli) -> Result<Decoder> {
     Ok(Decoder::new(game, pia, cli.broadcast_ip))
 }
 
+fn visible_in_stream(
+    mode: DisplayMode,
+    hide_cycle: bool,
+    protocol: Option<u8>,
+    kind: &str,
+    layout: Option<&str>,
+    has_capture_delay: bool,
+) -> bool {
+    if mode == DisplayMode::Normal
+        && (protocol == Some(0)
+            || protocol == Some(11) && kind != "PrivateSetting"
+            || protocol == Some(5) && kind == "UnreliableProtocol")
+    {
+        return false;
+    }
+    !hide_cycle
+        || !((protocol == Some(3) && !has_capture_delay)
+            || protocol == Some(5) && layout != Some("confirmed_fields"))
+}
+
 fn process<R: Read>(
     input: R,
     cli: &Cli,
     decoder: &mut Decoder,
     target: Option<&Target>,
+    publisher: Option<&mut visualizer::Publisher>,
+    control: Option<&control::Control>,
 ) -> Result<()> {
     let mut reader = Reader::new(input)?;
     let mut packets = 0u64;
@@ -211,13 +268,18 @@ fn process<R: Read>(
     let mut authentication_failures = 0u64;
     let mut malformed = 0u64;
     let mut previewer = WavePreviewer::default();
+    let mut publisher = publisher;
     while let Some(record) = reader.next_record()? {
         match record {
             Ok(packet) => {
                 packets += 1;
-                for mut row in decoder.process(&packet, cli.details) {
+                if let Some(control) = control {
+                    control.apply_pending(decoder);
+                }
+                let mut rows = decoder.process(&packet, cli.details);
+                for row in &mut rows {
                     row.direction = target.map(|value| direction(&packet, value).into());
-                    row.wave_preview = previewer.observe(&row);
+                    row.wave_preview = previewer.observe(row);
                     match row.status.as_str() {
                         "authenticated" | "proof_verified" => authenticated += 1,
                         "key_missing" | "key_or_broadcast_missing" | "game_key_missing" => {
@@ -228,17 +290,21 @@ fn process<R: Read>(
                         s if s.contains("malformed") || s.contains("invalid") => malformed += 1,
                         _ => {},
                     }
-                    if cli.mode == DisplayMode::Normal
-                        && (matches!(row.protocol, Some(0 | 11))
-                            || row.protocol == Some(5) && row.kind == "UnreliableProtocol")
-                    {
-                        continue;
-                    }
-                    if cli.hide_cycle
-                        && (row.protocol == Some(3)
-                            || row.protocol == Some(5)
-                                && row.layout.as_deref() != Some("confirmed_fields"))
-                    {
+                }
+                if let Some(publisher) = publisher.as_deref_mut() {
+                    publisher.emit(&packet, &rows);
+                }
+                for row in rows {
+                    if !visible_in_stream(
+                        cli.mode,
+                        cli.hide_cycle,
+                        row.protocol,
+                        &row.kind,
+                        row.layout.as_deref(),
+                        row.fields
+                            .iter()
+                            .any(|field| field.name == "CaptureResponseDelayMs"),
+                    ) {
                         continue;
                     }
                     print_row(&row, cli.jsonl, cli.details)?;
@@ -342,6 +408,8 @@ fn capture(
     target: Option<&Target>,
     interface: &str,
     output: &Path,
+    publisher: Option<&mut visualizer::Publisher>,
+    control: Option<&control::Control>,
 ) -> Result<()> {
     let (mut command, tool_name) = capture_backend::host_command(interface)?;
     let file = private_output(output)?;
@@ -388,6 +456,9 @@ fn capture(
         let _ = std::fs::remove_file(output);
         return Err(format!("capture signal handler: {error}"));
     }
+    if let Some(control) = control {
+        control.set_running(true);
+    }
     let result = process(
         Tee {
             source: stdout,
@@ -396,6 +467,8 @@ fn capture(
         cli,
         decoder,
         target,
+        publisher,
+        control,
     );
     if let Err(error) = result {
         // The capture tool may close its pipe just before its exit status becomes
@@ -478,18 +551,52 @@ fn run() -> Result<()> {
     }
     let mut decoder = decoder(&cli)?;
     let target = target(&cli)?;
-    match &cli.command {
+    let mut publisher = visualizer::Publisher::start(cli.visualizer_url.as_deref())?;
+    let control_port = match &cli.command {
+        Mode::Capture { control_port, .. } => *control_port,
+        _ => None,
+    };
+    let control = control_port
+        .map(|port| {
+            control::Control::start(
+                port,
+                startup_key_source(&cli),
+                publisher
+                    .as_ref()
+                    .map(visualizer::Publisher::connection_state),
+            )
+        })
+        .transpose()?;
+    let result = match &cli.command {
         Mode::ExportTable { .. } => unreachable!(),
         Mode::Inspect { pcap } => process(
             File::open(pcap).map_err(|e| format!("PCAP unavailable: {e}"))?,
             &cli,
             &mut decoder,
             target.as_ref(),
+            publisher.as_mut(),
+            None,
         ),
-        Mode::Capture { interface, output } => {
-            capture(&cli, &mut decoder, target.as_ref(), interface, output)
-        },
+        Mode::Capture {
+            interface, output, ..
+        } => capture(
+            &cli,
+            &mut decoder,
+            target.as_ref(),
+            interface,
+            output,
+            publisher.as_mut(),
+            control.as_ref(),
+        ),
+    };
+    if let Some(control) = control {
+        control.set_running(false);
+        control.finish();
     }
+    if let Some(publisher) = publisher {
+        publisher.finish();
+    }
+    result
 }
 
 fn main() {

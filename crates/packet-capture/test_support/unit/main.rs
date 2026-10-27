@@ -2,6 +2,50 @@ use super::*;
 use std::io::Cursor;
 
 #[test]
+fn normal_stream_keeps_recognized_private_setting() {
+    assert!(visible_in_stream(
+        DisplayMode::Normal,
+        false,
+        Some(11),
+        "PrivateSetting",
+        Some("confirmed_fields"),
+        false
+    ));
+    assert!(!visible_in_stream(
+        DisplayMode::Normal,
+        false,
+        Some(11),
+        "BroadcastReliableProtocol",
+        Some("type_only"),
+        false
+    ));
+    assert!(visible_in_stream(
+        DisplayMode::Debug,
+        false,
+        Some(11),
+        "BroadcastReliableProtocol",
+        Some("type_only"),
+        false
+    ));
+    assert!(!visible_in_stream(
+        DisplayMode::Normal,
+        true,
+        Some(3),
+        "RTTProtocol",
+        Some("confirmed_fields"),
+        false
+    ));
+    assert!(visible_in_stream(
+        DisplayMode::Normal,
+        true,
+        Some(3),
+        "RTTProtocol",
+        Some("confirmed_fields"),
+        true
+    ));
+}
+
+#[test]
 fn arrows_are_relative_to_the_explicit_target() {
     let target_mac = parse_mac("02:00:00:00:00:01").unwrap();
     assert_eq!(target_mac, [0x02, 0, 0, 0, 0, 1]);
@@ -62,4 +106,44 @@ fn capture_output_is_private_and_never_overwrites() {
             0o600
         );
     }
+}
+
+#[test]
+fn only_opt_in_capture_can_start_without_a_key() {
+    let controlled = Cli::try_parse_from([
+        "inkscope",
+        "capture",
+        "--interface",
+        "test0",
+        "--output",
+        "capture.pcap",
+        "--control-port",
+        "10253",
+    ])
+    .unwrap();
+    assert!(decoder(&controlled).is_ok());
+
+    let ordinary = Cli::try_parse_from([
+        "inkscope",
+        "capture",
+        "--interface",
+        "test0",
+        "--output",
+        "capture.pcap",
+    ])
+    .unwrap();
+    assert!(decoder(&ordinary).is_err());
+
+    let inspect = Cli::try_parse_from(["inkscope", "inspect", "capture.pcap"]).unwrap();
+    assert!(decoder(&inspect).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "inkscope",
+            "inspect",
+            "capture.pcap",
+            "--control-port",
+            "10253",
+        ])
+        .is_err()
+    );
 }

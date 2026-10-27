@@ -49,12 +49,27 @@ dist/inkscope capture --interface en18 \
 | `--target-mac MAC` | 対象機の MAC を基準に送受信方向を表示。`--target-ip` とは併用不可 |
 | `--target-ip IPv4` | 対象機の IPv4 を基準に送受信方向を表示。`--target-mac` とは併用不可 |
 | `--jsonl` | 1 行 1 JSON オブジェクトで出力。送受信アドレスと全フィールドを含む |
-| `--mode MODE` | `normal`（既定）は Empty、BroadcastReliableProtocol、型不明の UnreliableProtocol を省略。`debug` は表示する |
+| `--mode MODE` | `normal`（既定）は Empty、識別できない BroadcastReliableProtocol、型不明の UnreliableProtocol を省略。認証済み PrivateSetting は表示する。`debug` は全行を表示する |
 | `--details` | 通常表示に全フィールド、ビット範囲、復号済み本文の HEX、先読みの名目 tick などを追加。JSONL にはヘッダーの送受信 ID と本文 HEX を追加 |
-| `--hide-cycle` | RttProtocol の全行と、本文の確認が済んでいない UnreliableProtocol の行を省略 |
+| `--hide-cycle` | 対応する応答から遅延を計算できた RTTProtocol 行を残し、他の RTTProtocol と本文未確認の UnreliableProtocol を省略 |
+| `--visualizer-url URL` | 解析イベントをローカルの InkScope Visualizer に WebSocket 送信。`INKSCOPE_VISUALIZER_TOKEN` と併用 |
+| `capture --control-port PORT` | `127.0.0.1` に鍵制御 API を起動。`INKSCOPE_CONTROL_TOKEN` と併用 |
 | `-h`、`--help` | ヘルプを表示 |
 
-`inspect` と `capture` では、`--random-table`、`--game-key`、`--game-key-file`、`--elf` のちょうど1つが必要です。別バージョンの GameKey は `--game-key` または `--game-key-file` で指定できますが、そのバージョンの本文解析は未検証です。鍵ファイルと参照表は利用者本人だけが読める権限で保管してください。`--game-key` はシェル履歴・プロセス引数に残ります。`--mode` と `--hide-cycle` の省略設定は `--jsonl` にも適用されます。方向の `->` は対象からの送信、`<-` は対象への送信です。
+`inspect` と `capture` では通常、`--random-table`、`--game-key`、`--game-key-file`、`--elf` のちょうど1つが必要です。`capture --control-port` の場合だけ、鍵なしで起動して後から Visualizer の Settings で登録できます。起動時に指定した鍵は制御 API から上書きできません。登録・解除は次の有効な UDP レコードを処理する直前に反映されます。別バージョンの GameKey は `--game-key` または `--game-key-file` で指定できますが、そのバージョンの本文解析は未検証です。鍵ファイルと参照表は利用者本人だけが読める権限で保管してください。`--game-key` はシェル履歴・プロセス引数に残ります。`--mode` と `--hide-cycle` の省略設定は `--jsonl` にも適用されます。方向の `->` は対象からの送信、`<-` は対象への送信です。
+
+## Visualizer 接続
+
+Visualizer を `127.0.0.1:10252` で起動し、両プロセスに同じ `INKSCOPE_VISUALIZER_TOKEN` を設定します。Settings から GameKey を登録する場合は、別の `INKSCOPE_CONTROL_TOKEN`（32 文字以上の秘密の ASCII 文字列）を両プロセスへ設定します。鍵をコマンドライン引数に載せずに起動する例です。
+
+~~~sh
+dist/inkscope capture --interface en18 \
+  --output "$HOME/captures/capture.pcap" \
+  --visualizer-url ws://127.0.0.1:10252/api/ingest \
+  --control-port 10254
+~~~
+
+PCAP 保存は表示用の送信状態と独立しています。`CaptureResponseDelayMs` は認証済み RTTProtocol 要求から対応する応答までのキャプチャ時刻の差で、送信側の `ElapsedMicroseconds` や通信路だけの RTT とは異なります。
 
 `capture` の外部ツールと権限は OS によって異なります。`--interface` には対象の **Ethernet** インターフェースを指定してください。PCAP リーダーは現在 Ethernet/IPv4/UDP のみ対応し、Linux の `any` やループバックなど別のリンク形式は解析できません。Unix の新規 PCAP は 0600 で作成し、Windows では保存先の ACL を引き継ぎます。
 
@@ -79,7 +94,7 @@ OnlineCoopSetting から GameSeed を得ると、WAVE 0〜4 のイベントと�
 | 0 | Empty | 空の keepalive 形 | 別の形の有無 |
 | 1 | NetProtocol | 一部 subtype、Sequence、Generation、Reason、Detail | 残る subtype と本文 |
 | 2 | TurnProtocol | 型名 | 本文 |
-| 3 | RttProtocol | 21 バイト形の Type、OriginTick、ElapsedMicroseconds | 他の形 |
+| 3 | RTTProtocol | 21 バイト形の Type、OriginTick、ElapsedMicroseconds、DestinationVariableId、ProtocolStationVariableId、対応する応答の CaptureResponseDelayMs | 他の形 |
 | 4 | SyncProtocol | 型名 | 本文 |
 | 5 | UnreliableProtocol | CoopSequenceNetState、CoopSeqPlayerNetState の一部 | 残る配列・Group |
 | 6 | CloneProtocol | 型名 | 本文 |
@@ -87,7 +102,7 @@ OnlineCoopSetting から GameSeed を得ると、WAVE 0〜4 のイベントと�
 | 8 | BroadcastEventProtocol | 観測済み 39 型の名前、7 型の本文の一部 | 残るイベント本文 |
 | 9 | ClockProtocol | 型名 | 本文 |
 | 10 | ReliableProtocol | 型名 | 本文 |
-| 11 | BroadcastReliableProtocol | 161 バイト形の値候補 | PrivateSetting 本文と値の意味 |
+| 11 | BroadcastReliableProtocol | 確認済み 78/161/226 バイト形の PrivateSetting、StageId、内部整数 Difficulty | 残る PrivateSetting 形式と本文 |
 | 12 | StreamBroadcastReliableProtocol | 型名 | 本文 |
 | 13 | SessionProtocol | subtype 番号 | subtype 本文 |
 | 14 | NatTraversalResultProtocol | 型名 | 本文 |

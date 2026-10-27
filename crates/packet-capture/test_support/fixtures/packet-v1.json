@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "type": "packet",
+  "session_id": "d61c1c49-4dae-4c6f-aa41-4f7f2a44411e",
+  "record": "1",
+  "timestamp_ns": "1793059200123456789",
+  "packet": {
+    "source_ip": "192.0.2.10",
+    "source_port": 49152,
+    "source_mac": "02:00:00:00:00:10",
+    "destination_ip": "192.0.2.11",
+    "destination_port": 49153,
+    "destination_mac": "02:00:00:00:00:11",
+    "payload_hex": "0032abcd"
+  },
+  "rows": [
+    {
+      "kind": "RTTProtocol",
+      "status": "authenticated",
+      "protocol": 3,
+      "fields": [
+        { "name": "Type", "value": "1", "bits": [0, 8] },
+        { "name": "CaptureResponseDelayMs", "value": "42.6", "bits": [8, 40] }
+      ]
+    }
+  ]
+}

@@ -25,6 +25,7 @@ pub fn print_row(row: &Row, jsonl: bool, details: bool) -> Result<()> {
             matches!(
                 f.name.as_str(),
                 "StageResource"
+                    | "StageId"
                     | "StageName"
                     | "JobType"
                     | "Difficulty"
@@ -35,7 +36,7 @@ pub fn print_row(row: &Row, jsonl: bool, details: bool) -> Result<()> {
                     | "SpawnZ"
                     | "Quota"
                     | "Sequence"
-                    | "HazardCandidatePercent"
+                    | "CaptureResponseDelayMs"
                     | "Reason"
                     | "Detail"
                     | "ValuePlusOne"

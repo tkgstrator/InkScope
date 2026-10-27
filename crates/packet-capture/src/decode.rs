@@ -92,6 +92,8 @@ struct Candidate {
 }
 
 const MAX_CANDIDATE_HOSTS: usize = 16;
+const RTT_PENDING_LIMIT: usize = 256;
+const RTT_PENDING_NS: u64 = 2_000_000_000;
 
 fn push_candidate(candidates: &mut Vec<Candidate>, candidate: Candidate) {
     if let Some(existing) = candidates
@@ -125,6 +127,7 @@ pub struct Decoder {
     broadcast: Option<Ipv4Addr>,
     requests: Vec<Request>,
     candidates: HashMap<Ipv4Addr, Vec<Candidate>>,
+    rtt_pending: HashMap<(Ipv4Addr, Ipv4Addr, u64), u64>,
 }
 
 impl Decoder {
@@ -139,7 +142,54 @@ impl Decoder {
             broadcast,
             requests: vec![],
             candidates: HashMap::new(),
+            rtt_pending: HashMap::new(),
         }
+    }
+
+    /// A control-plane key change invalidates proof and derived keys from the
+    /// previous GameKey. An explicitly supplied PiaKey remains independent.
+    pub fn replace_game_key(&mut self, game_key: Option<GameKey>) {
+        self.game_key = game_key;
+        self.requests.clear();
+        self.candidates.clear();
+        self.rtt_pending.clear();
+    }
+
+    /// Capture-time request-to-response interval, including peer processing and capture effects.
+    /// This is separate from the sender's ElapsedMicroseconds and is not network-only RTT.
+    fn rtt_capture_delay(&mut self, packet: &UdpPacket, chunk: &Chunk) -> Option<String> {
+        let p = &chunk.payload;
+        if chunk.protocol != 3 || p.len() != 21 || !matches!(p[0], 0 | 1) {
+            return None;
+        }
+        self.rtt_pending.retain(|_, timestamp| {
+            packet.timestamp_ns.saturating_sub(*timestamp) <= RTT_PENDING_NS
+        });
+        let origin = u64::from_be_bytes(p[1..9].try_into().ok()?);
+        if p[0] == 0 {
+            self.rtt_pending.insert(
+                (packet.source, packet.destination, origin),
+                packet.timestamp_ns,
+            );
+            if self.rtt_pending.len() > RTT_PENDING_LIMIT
+                && let Some(oldest) = self
+                    .rtt_pending
+                    .iter()
+                    .min_by_key(|(_, timestamp)| *timestamp)
+                    .map(|(key, _)| *key)
+            {
+                self.rtt_pending.remove(&oldest);
+            }
+            return None;
+        }
+        let key = (packet.destination, packet.source, origin);
+        let timestamp = *self.rtt_pending.get(&key)?;
+        let elapsed = packet.timestamp_ns.checked_sub(timestamp)?;
+        if elapsed == 0 || elapsed > RTT_PENDING_NS {
+            return None;
+        }
+        self.rtt_pending.remove(&key);
+        Some(format!("{:.3}", elapsed as f64 / 1_000_000.0))
     }
 
     pub fn process(&mut self, packet: &UdpPacket, details: bool) -> Vec<Row> {
@@ -354,10 +404,9 @@ impl Decoder {
             return vec![output];
         };
         match chunks(&pia.body) {
-            Ok(chunks) => chunks
-                .into_iter()
-                .enumerate()
-                .map(|(index, chunk)| {
+            Ok(chunks) => {
+                let mut rows = Vec::with_capacity(chunks.len());
+                for (index, chunk) in chunks.into_iter().enumerate() {
                     let mut output = row(packet, &describe_chunk(&chunk), "authenticated");
                     output.protocol = Some(chunk.protocol);
                     output.port = chunk.port;
@@ -388,6 +437,11 @@ impl Decoder {
                         .into(),
                     );
                     output.fields.extend(semantic);
+                    if let Some(delay) = self.rtt_capture_delay(packet, &chunk) {
+                        output
+                            .fields
+                            .push(field("CaptureResponseDelayMs", delay, None));
+                    }
                     if details {
                         output
                             .fields
@@ -399,9 +453,10 @@ impl Decoder {
                     if details {
                         output.authenticated_payload_hex = Some(hex::encode(&chunk.payload));
                     }
-                    output
-                })
-                .collect(),
+                    rows.push(output);
+                }
+                rows
+            },
             Err(error) => {
                 let mut output = row(packet, "Pia", "authenticated_malformed_chunks");
                 output.fields.push(field("Error", error, None));
@@ -489,7 +544,7 @@ fn protocol_name(id: u8) -> &'static str {
         0 => "Empty",
         1 => "NetProtocol",
         2 => "TurnProtocol",
-        3 => "RttProtocol",
+        3 => "RTTProtocol",
         4 => "SyncProtocol",
         5 => "UnreliableProtocol",
         6 => "CloneProtocol",
@@ -583,6 +638,7 @@ fn describe_chunk(chunk: &Chunk) -> String {
             _ => base.into(),
         },
         8 => event_type(&chunk.payload).map_or(base, event_name).into(),
+        11 if private_setting(chunk).is_some() => "PrivateSetting".into(),
         _ => base.into(),
     }
 }
@@ -596,6 +652,68 @@ fn bits(bytes: &[u8], start: usize, width: usize) -> Option<u64> {
         value |= (((bytes[(start + bit) / 8] >> ((start + bit) % 8)) & 1) as u64) << bit;
     }
     Some(value)
+}
+
+struct PrivateSetting {
+    stage_id: Option<String>,
+    difficulty_wire: Option<(u64, usize)>,
+}
+
+fn private_stage_id(payload: &[u8]) -> Option<String> {
+    let bytes = (0..64)
+        .map(|index| bits(payload, 100 + index * 8, 8).map(|value| value as u8))
+        .collect::<Option<Vec<_>>>()?;
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    if !bytes[..end].iter().all(u8::is_ascii_graphic) || !bytes[end..].iter().all(|byte| *byte == 0)
+    {
+        return None;
+    }
+    String::from_utf8(bytes[..end].to_vec()).ok()
+}
+
+fn private_setting(chunk: &Chunk) -> Option<PrivateSetting> {
+    let p = &chunk.payload;
+    if chunk.protocol != 11
+        || chunk.port != Some(100)
+        || !matches!(p.len(), 78 | 161 | 226)
+        || p[0] != 7
+        || usize::from(u16::from_be_bytes([p[1], p[2]])) != p.len() - 8
+    {
+        return None;
+    }
+    match p.len() {
+        78 if bits(p, 97, 3) == Some(4)
+            && bits(p, 612, 2) == Some(1)
+            && bits(p, 614, 1) == Some(0)
+            && bits(p, 615, 3) == Some(0)
+            && bits(p, 618, 6) == Some(0) =>
+        {
+            Some(PrivateSetting {
+                stage_id: Some(private_stage_id(p)?),
+                difficulty_wire: None,
+            })
+        },
+        161 if bits(p, 97, 5) == Some(16) && bits(p, 1287, 1) == Some(0) => Some(PrivateSetting {
+            stage_id: None,
+            difficulty_wire: Some((bits(p, 102, 11)?, 102)),
+        }),
+        // NXCTF docs/security/2026-10-25-s3-salmon-settings-and-gameplay-static-evidence.md:
+        // Common spans bits 100..615; presence bits 615/616 precede Coop at
+        // 617. Coop's first 11 bits encode the internal value plus one.
+        226 if bits(p, 97, 3) == Some(4)
+            && bits(p, 612, 2) == Some(1)
+            && bits(p, 614, 1) == Some(0)
+            && bits(p, 615, 2) == Some(2)
+            && bits(p, 1802, 1) == Some(0)
+            && bits(p, 1803, 5) == Some(0) =>
+        {
+            Some(PrivateSetting {
+                stage_id: Some(private_stage_id(p)?),
+                difficulty_wire: Some((bits(p, 617, 11)?, 617)),
+            })
+        },
+        _ => None,
+    }
 }
 
 fn coop_state_group(payload: &[u8]) -> Option<u64> {
@@ -709,6 +827,8 @@ fn semantic_fields(chunk: &Chunk) -> Vec<Field> {
             }
         },
         3 if p.len() == 21 => {
+            // ElapsedMicroseconds belongs to this sender; it is not the
+            // capture-time interval computed after a matched Type 1 response.
             fields.push(field("Type", p[0], Some([0, 8])));
             fields.push(field(
                 "OriginTick",
@@ -719,6 +839,16 @@ fn semantic_fields(chunk: &Chunk) -> Vec<Field> {
                 "ElapsedMicroseconds",
                 u64::from_be_bytes(p[9..17].try_into().unwrap()),
                 Some([72, 136]),
+            ));
+            fields.push(field(
+                "DestinationVariableId",
+                u16::from_be_bytes(p[17..19].try_into().unwrap()),
+                Some([136, 152]),
+            ));
+            fields.push(field(
+                "ProtocolStationVariableId",
+                u16::from_be_bytes(p[19..21].try_into().unwrap()),
+                Some([152, 168]),
             ));
         },
         5 => {
@@ -819,15 +949,17 @@ fn semantic_fields(chunk: &Chunk) -> Vec<Field> {
                 }
             }
         },
-        11 if p.len() == 161 && chunk.port == Some(100) => {
-            // Observed standalone q candidate: not a complete serializer decoder.
-            let q = bits(p, 102, 10).unwrap_or(0);
-            if bits(p, 96, 6) == Some(32) && q > 0 && (q - 1).is_multiple_of(5) && q <= 1001 {
-                fields.push(field(
-                    "HazardCandidatePercent",
-                    format!("{:.1}", (q as f64 - 1.0) / 5.0),
-                    Some([102, 112]),
-                ));
+        11 => {
+            if let Some(setting) = private_setting(chunk) {
+                if let Some(stage_id) = setting.stage_id {
+                    fields.push(field("StageId", stage_id, Some([100, 612])));
+                }
+                if let Some((wire, start)) = setting.difficulty_wire {
+                    fields.push(field("DifficultyWire", wire, Some([start, start + 11])));
+                    if wire > 0 {
+                        fields.push(field("Difficulty", wire - 1, None));
+                    }
+                }
             }
         },
         _ => {},
