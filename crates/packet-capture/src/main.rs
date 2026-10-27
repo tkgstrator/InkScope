@@ -551,7 +551,10 @@ fn run() -> Result<()> {
     }
     let mut decoder = decoder(&cli)?;
     let target = target(&cli)?;
-    let mut publisher = visualizer::Publisher::start(cli.visualizer_url.as_deref())?;
+    let mut publisher = visualizer::Publisher::start(
+        cli.visualizer_url.as_deref(),
+        matches!(cli.command, Mode::Inspect { .. }),
+    )?;
     let control_port = match &cli.command {
         Mode::Capture { control_port, .. } => *control_port,
         _ => None,

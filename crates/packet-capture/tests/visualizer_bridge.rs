@@ -150,6 +150,146 @@ fn opt_in_websocket_receives_raw_packet_without_changing_terminal_output() {
 }
 
 #[test]
+fn offline_inspect_delivers_more_than_the_live_queue_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let pcap = dir.path().join("many.pcap");
+    let one = one_packet_pcap();
+    let mut many = one[..24].to_vec();
+    for _ in 0..500 {
+        many.extend_from_slice(&one[24..]);
+    }
+    fs::write(&pcap, many).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut websocket = accept(stream).unwrap();
+        let mut received = 0;
+        for expected in 1..=500 {
+            let message = websocket.read().unwrap();
+            let event: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_eq!(event["record"], expected.to_string());
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "version": 1,
+                        "type": "ack",
+                        "session_id": event["session_id"],
+                        "record": event["record"],
+                        "result": "accepted",
+                        "persistence": "memory"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            received += 1;
+        }
+        received
+    });
+
+    let output = run_inspect(
+        &pcap,
+        Some(&format!("ws://127.0.0.1:{port}/api/ingest")),
+        Some("test-token"),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Visualizer export"));
+    assert_eq!(server.join().unwrap(), 500);
+}
+
+#[test]
+fn offline_inspect_waits_briefly_for_a_late_visualizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let pcap = dir.path().join("late.pcap");
+    fs::write(&pcap, one_packet_pcap()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let server = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        let listener = TcpListener::bind(address).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut websocket = accept(stream).unwrap();
+        let event: Value =
+            serde_json::from_str(websocket.read().unwrap().to_text().unwrap()).unwrap();
+        websocket
+            .send(Message::Text(
+                serde_json::json!({
+                    "version": 1, "type": "ack", "session_id": event["session_id"],
+                    "record": event["record"], "result": "accepted", "persistence": "memory"
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        event["record"].clone()
+    });
+    let output = run_inspect(
+        &pcap,
+        Some(&format!("ws://127.0.0.1:{}/api/ingest", address.port())),
+        Some("test-token"),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Visualizer export"));
+    assert_eq!(server.join().unwrap(), "1");
+}
+
+#[test]
+fn a_rejected_record_does_not_discard_the_next_offline_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let pcap = dir.path().join("three.pcap");
+    let one = one_packet_pcap();
+    fs::write(&pcap, [&one[..], &one[24..], &one[24..]].concat()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut websocket = accept(stream).unwrap();
+        for (record, result) in [("1", "stale"), ("2", "error"), ("3", "accepted")] {
+            let event: Value =
+                serde_json::from_str(websocket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(event["record"], record);
+            let reply = if result == "error" {
+                serde_json::json!({"version": 1, "type": "error", "code": "invalid_packet"})
+            } else {
+                serde_json::json!({
+                    "version": 1, "type": "ack", "session_id": event["session_id"],
+                    "record": event["record"], "result": result, "persistence": "memory"
+                })
+            };
+            websocket
+                .send(Message::Text(reply.to_string().into()))
+                .unwrap();
+        }
+    });
+    let output = run_inspect(
+        &pcap,
+        Some(&format!("ws://127.0.0.1:{port}/api/ingest")),
+        Some("test-token"),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("dropped 2 UI copies"));
+    server.join().unwrap();
+}
+
+#[test]
 fn unavailable_visualizer_does_not_stop_offline_inspection() {
     let dir = tempfile::tempdir().unwrap();
     let pcap = dir.path().join("one.pcap");

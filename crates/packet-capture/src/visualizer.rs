@@ -17,6 +17,7 @@ const MAX_WIRE_BYTES: usize = 512 * 1024;
 const QUEUE_CAPACITY: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(350);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+const OFFLINE_RETRY_GRACE: Duration = Duration::from_millis(1500);
 const FINISH_GRACE: Duration = Duration::from_secs(2);
 const ACK_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -43,6 +44,7 @@ pub(crate) struct Publisher {
     worker: JoinHandle<SenderReport>,
     queue_drops: u64,
     connection: ConnectionState,
+    offline: bool,
 }
 
 #[derive(Clone)]
@@ -60,7 +62,7 @@ impl ConnectionState {
 }
 
 impl Publisher {
-    pub(crate) fn start(cli_url: Option<&str>) -> Result<Option<Self>, String> {
+    pub(crate) fn start(cli_url: Option<&str>, offline: bool) -> Result<Option<Self>, String> {
         let configured_url = cli_url
             .map(str::to_owned)
             .or_else(|| std::env::var("INKSCOPE_VISUALIZER_URL").ok());
@@ -83,14 +85,16 @@ impl Publisher {
         let (sender, receiver) = mpsc::sync_channel::<Outbound>(QUEUE_CAPACITY);
         let connection = ConnectionState(Arc::new(AtomicU8::new(0)));
         let worker_connection = connection.clone();
-        let worker =
-            thread::spawn(move || sender_loop(receiver, url, address, token, worker_connection));
+        let worker = thread::spawn(move || {
+            sender_loop(receiver, url, address, token, worker_connection, offline)
+        });
         Ok(Some(Self {
             session_id: Uuid::new_v4().to_string(),
             sender,
             worker,
             queue_drops: 0,
             connection,
+            offline,
         }))
     }
 
@@ -109,22 +113,30 @@ impl Publisher {
             record: packet.record.to_string(),
             session_id: self.session_id.clone(),
         };
-        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
-            self.sender.try_send(outbound)
-        {
+        let failed = if self.offline {
+            self.sender.send(outbound).is_err()
+        } else {
+            matches!(
+                self.sender.try_send(outbound),
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+            )
+        };
+        if failed {
             self.queue_drops += 1;
         }
     }
 
     pub(crate) fn finish(self) {
         drop(self.sender);
-        let deadline = Instant::now() + FINISH_GRACE;
-        while !self.worker.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if !self.worker.is_finished() {
-            eprintln!("Visualizer export sender is still busy; pending UI copies may be lost");
-            return;
+        if !self.offline {
+            let deadline = Instant::now() + FINISH_GRACE;
+            while !self.worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if !self.worker.is_finished() {
+                eprintln!("Visualizer export sender is still busy; pending UI copies may be lost");
+                return;
+            }
         }
         let report = match self.worker.join() {
             Ok(report) => report,
@@ -154,21 +166,41 @@ fn sender_loop(
     address: SocketAddr,
     token: String,
     connection: ConnectionState,
+    offline: bool,
 ) -> SenderReport {
     let mut socket: Option<WebSocket<TcpStream>> = None;
     let mut next_connect = Instant::now();
+    let mut offline_retry_deadline: Option<Instant> = None;
     let mut report = SenderReport::default();
     while let Ok(outbound) = receiver.recv() {
-        if socket.is_none() && Instant::now() >= next_connect {
+        if offline && socket.is_none() && offline_retry_deadline.is_none() {
+            offline_retry_deadline = Some(Instant::now() + OFFLINE_RETRY_GRACE);
+        }
+        while socket.is_none() {
+            let now = Instant::now();
+            if now < next_connect {
+                let Some(deadline) = offline_retry_deadline.filter(|_| offline) else {
+                    break;
+                };
+                if now >= deadline {
+                    break;
+                }
+                thread::sleep((next_connect - now).min(deadline - now));
+                continue;
+            }
             connection.0.store(3, Ordering::Relaxed);
             match connect_local(&url, address, &token) {
                 Ok(connected) => {
                     connection.0.store(1, Ordering::Relaxed);
                     socket = Some(connected);
+                    offline_retry_deadline = None;
                 },
                 Err(_) => {
                     connection.0.store(2, Ordering::Relaxed);
                     next_connect = Instant::now() + RECONNECT_INTERVAL;
+                    if !offline {
+                        break;
+                    }
                 },
             }
         }
@@ -181,12 +213,16 @@ fn sender_loop(
             } else {
                 match read_ack(connected, &outbound.session_id, &outbound.record) {
                     Ok(true) => continue,
-                    Ok(false) | Err(AckFailure::Rejected) => report.dropped += 1,
+                    Ok(false) | Err(AckFailure::Rejected) => {
+                        report.dropped += 1;
+                        continue;
+                    },
                     Err(AckFailure::Uncertain) => report.uncertain += 1,
                 }
                 socket = None;
                 connection.0.store(2, Ordering::Relaxed);
                 next_connect = Instant::now() + RECONNECT_INTERVAL;
+                offline_retry_deadline = None;
             }
         } else {
             report.dropped += 1;
@@ -437,6 +473,7 @@ mod tests {
             worker,
             queue_drops: 0,
             connection: ConnectionState(Arc::new(AtomicU8::new(0))),
+            offline: false,
         };
         let start = std::time::Instant::now();
         publisher.finish();
@@ -457,6 +494,7 @@ mod tests {
                 address,
                 "test-token".into(),
                 ConnectionState(Arc::new(AtomicU8::new(0))),
+                false,
             )
         });
         let session_id = "d61c1c49-4dae-4c6f-aa41-4f7f2a44411e";
