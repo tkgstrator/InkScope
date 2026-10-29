@@ -109,9 +109,9 @@ fn waves_cli_shows_five_generated_records_and_nominal_queues_for_both_ordinary_j
             .collect::<Vec<_>>(),
         [
             "WAVE 0 generated event=0 tide=0",
-            "WAVE 1 generated event=0 tide=2",
+            "WAVE 1 generated event=0 tide=0",
             "WAVE 2 generated event=0 tide=2",
-            "WAVE 3 generated event=0 tide=2",
+            "WAVE 3 generated event=0 tide=1",
             "WAVE 4 generated event=0 tide=1",
         ]
     );
@@ -155,15 +155,17 @@ fn waves_cli_keeps_generated_values_when_the_queue_event_is_unsupported() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(wave_rows(&stdout).len(), 5);
     assert!(
-        wave_rows(&stdout)[0].contains("WAVE 0 generated event=3 tide=2 queue=unsupported event 3")
+        wave_rows(&stdout)[0].contains("WAVE 0 generated event=3 tide=1 queue=unsupported event 3")
     );
 }
 
 #[test]
 fn waves_cli_shows_direct_applied_event_and_tide_from_supplied_active_players() {
+    // Native event/tide draws give event 6, tide 2 in the first record for
+    // this synthetic seed, preserving coverage of the direct tide-zero write.
     let output = run(&[
         "waves",
-        "1",
+        "22",
         "2",
         "3",
         "4",
@@ -184,9 +186,9 @@ fn waves_cli_shows_direct_applied_event_and_tide_from_supplied_active_players() 
     assert!(stdout.contains("special-tide flags inactive (assumed)"));
     assert!(stdout.contains("scheduler-time mode does not bypass Rare queue (assumed)"));
     assert!(
-        wave_rows(&stdout)[1].contains("generated event=6 tide=2 applied-direct event=6 tide=0")
+        wave_rows(&stdout)[0].contains("generated event=6 tide=2 applied-direct event=6 tide=0")
     );
-    assert!(wave_rows(&stdout)[1].contains("nominal Rare ticks="));
+    assert!(wave_rows(&stdout)[0].contains("nominal Rare ticks="));
     assert!(stdout.contains("later overrides and event handlers are not inferred"));
 }
 
@@ -364,18 +366,19 @@ fn waves_cli_uses_supplied_job_zero_score_for_target_three_and_queue_branch() {
     assert!(active_stdout.contains("special queue branch at target 3 (conditional)"));
     let active_rows = wave_rows(&active_stdout);
     assert_eq!(active_rows.len(), 5);
-    assert!(active_rows[3].contains("WAVE 3 generated event=0 tide=2"));
+    assert!(active_rows[3].contains("WAVE 3 generated event=0 tide=1"));
     assert!(active_rows[3].contains("queue_branch=special"));
     assert!(active_rows[3].contains("nominal Rare ticks=[0,0,0,0,480,776"));
-    assert!(active_rows[2].contains("queue_branch=normal"));
-    assert!(active_rows[4].contains("queue_branch=normal"));
+    assert!(active_rows[1].contains("queue_branch=normal"));
+    assert!(active_rows[2].contains("queue=unsupported event 3"));
+    assert!(active_rows[4].contains("queue=unsupported event 4"));
 
     let inactive = run(&[base.as_slice(), &["job0-score=5"]].concat());
     assert!(inactive.status.success());
     let inactive_stdout = String::from_utf8(inactive.stdout).unwrap();
     assert!(inactive_stdout.contains("special tide state=inactive (calculated)"));
     assert!(inactive_stdout.contains("lottery_draw=0xf1a9ae74"));
-    assert!(wave_rows(&inactive_stdout)[3].contains("WAVE 3 generated event=6 tide=2"));
+    assert!(wave_rows(&inactive_stdout)[3].contains("WAVE 3 generated event=5 tide=1"));
     assert!(wave_rows(&inactive_stdout)[3].contains("queue_branch=normal"));
     assert!(wave_rows(&inactive_stdout)[3].contains("nominal Rare ticks=[0,19,296,480"));
 }

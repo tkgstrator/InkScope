@@ -165,7 +165,7 @@ fn low_candidate_stream_is_shuffled_after_taking_eight() {
 }
 
 #[test]
-fn high_candidate_streams_use_head_insertion_tail_selection_and_three_shuffles() {
+fn high_candidate_streams_use_forward_order_head_selection_and_three_shuffles() {
     let seed = SeedWords::from_scene(SEED);
     let result = preprocess_weapon_candidates(
         seed,
@@ -174,7 +174,7 @@ fn high_candidate_streams_use_head_insertion_tail_selection_and_three_shuffles()
             second: &[44, 55],
         },
     );
-    assert_eq!(result.candidates, [55, 22, 33, 11]);
+    assert_eq!(result.candidates, [11, 22, 33, 44]);
     assert_eq!(result.rng.draws, 7);
     assert_eq!(
         result.rng.state.as_array(),
@@ -203,7 +203,7 @@ fn high_capacity_keeps_only_first_two_second_entries_after_nine_first_entries() 
             second: &[21, 22, 23],
         },
     );
-    assert_eq!(result.candidates, [13, 17, 19, 18]);
+    assert_eq!(result.candidates, [15, 14, 17, 18]);
     assert_eq!(result.rng.draws, 19);
     assert_eq!(
         result.rng.state.as_array(),
@@ -232,7 +232,7 @@ fn high_empty_first_stream_can_fill_nine_work_list_slots() {
             second: &[21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
         },
     );
-    assert_eq!(result.candidates, [28, 23]);
+    assert_eq!(result.candidates, [28, 25]);
     assert_eq!(result.rng.draws, 9);
     assert_eq!(
         result.rng.state.as_array(),

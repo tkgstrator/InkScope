@@ -113,9 +113,9 @@ pub fn weapon_rng_after_preprocess(
 /// Reproduce the selected branch's candidate order and shared weapon RNG.
 ///
 /// The low branch appends up to eight source candidates. The high branch
-/// head-inserts up to nine from the first source, shuffles, takes up to two
-/// tail entries, head-inserts from the second source until the remaining work
-/// list reaches nine, shuffles and takes up to two more, then shuffles the
+/// appends up to nine from the first source, shuffles, takes up to two
+/// head entries, appends from the second source until the remaining work
+/// list reaches nine, shuffles and takes up to two more heads, then shuffles the
 /// selected entries. Identities are opaque and duplicates remain distinct
 /// entries. Validity assumes every represented shuffle completed and indirect
 /// callbacks did not mutate the same RNG state.
@@ -153,26 +153,20 @@ pub(crate) fn preprocess_candidates<T: Copy>(
             candidates
         },
         CandidateStreams::High { first, second } => {
-            let mut work: Vec<T> = first.iter().copied().take(9).rev().collect();
+            let mut work: Vec<T> = first.iter().copied().take(9).collect();
             shuffle_candidates(&mut work, &mut state, &mut draws);
             let mut chosen = Vec::with_capacity(4);
-            for _ in 0..2 {
-                if let Some(candidate) = work.pop() {
-                    chosen.push(candidate);
-                }
-            }
+            let selected = work.len().min(2);
+            chosen.extend(work.drain(..selected));
             for &candidate in second {
                 if work.len() == 9 {
                     break;
                 }
-                work.insert(0, candidate);
+                work.push(candidate);
             }
             shuffle_candidates(&mut work, &mut state, &mut draws);
-            for _ in 0..2 {
-                if let Some(candidate) = work.pop() {
-                    chosen.push(candidate);
-                }
-            }
+            let selected = work.len().min(2);
+            chosen.extend(work.drain(..selected));
             shuffle_candidates(&mut chosen, &mut state, &mut draws);
             chosen
         },

@@ -31,11 +31,9 @@ impl WaveRng {
     }
 
     fn next_tide32(&mut self) -> u32 {
-        let [s0, s1, s2, s3] = self.state.as_array();
-        let t = s0 ^ (s0 << 11);
-        let value = s3 ^ (s3 >> 19) ^ t ^ (t >> 8);
-        self.state = XorShift128::from_words([s1, s2, s3, s3]);
-        value
+        // The positive-weight path at 0x37f6400 branches to 0x37f67b4;
+        // 0x37f67b8 writes the computed value back to the fourth word.
+        self.state.next32()
     }
 }
 

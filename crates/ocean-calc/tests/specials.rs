@@ -39,7 +39,7 @@ fn owned_low_vector_uses_private_domain_and_six_draws() {
 fn owned_high_vector_uses_all_three_shuffles_and_thirteen_draws() {
     let prediction = predict_private_specials(input(3 << 17), SpecialLookup::Known).unwrap();
     assert_eq!(prediction.branch, SpecialBranch::High);
-    assert_eq!(prediction.initial_specials, [20010, 20013, 20006, 20014]);
+    assert_eq!(prediction.initial_specials, [20009, 20007, 20014, 20012]);
     assert_eq!(prediction.final_specials, prediction.initial_specials);
     assert_eq!(prediction.rng.draws, 13);
     assert_eq!(
@@ -73,13 +73,13 @@ fn high_missing_lookup_skips_without_resampling_or_extra_draws() {
     let mut seen = Vec::new();
     let result = predict_private_specials(input(3 << 17), |candidate| {
         seen.push(candidate);
-        if candidate == 20013 {
+        if candidate == 20007 {
             SpecialLookup::Missing
         } else {
             SpecialLookup::Known(candidate)
         }
     });
-    assert_eq!(seen, [20010, 20013, 20006, 20014]);
+    assert_eq!(seen, [20009, 20007, 20014, 20012]);
     assert_eq!(
         result.unwrap_err(),
         SpecialError::InsufficientSpecials { found: 3 }
@@ -97,7 +97,7 @@ fn low_missing_selected_lookup_is_unsupported() {
 #[test]
 fn unknown_selected_lookup_never_fabricates_special_ids() {
     for effective_g in [0, 3 << 17] {
-        let candidate = if effective_g == 0 { 20013 } else { 20010 };
+        let candidate = if effective_g == 0 { 20013 } else { 20009 };
         assert_eq!(
             predict_private_specials(input(effective_g), |_| SpecialLookup::Unknown).unwrap_err(),
             SpecialError::UnknownAsset { candidate }

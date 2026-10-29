@@ -41,7 +41,8 @@ fn owned_stage_water_changes_the_independently_calculated_tide_vector() {
             .iter()
             .map(|selection| (selection.event_id, selection.tide_id))
             .collect::<Vec<_>>(),
-        [(0, 0), (0, 2), (0, 2), (0, 2), (0, 1)]
+        // Owned native tide loop, including the writeback at 0x37f67b8.
+        [(0, 0), (0, 0), (0, 2), (0, 1), (0, 1)]
     );
     assert_eq!(
         temple
@@ -50,7 +51,7 @@ fn owned_stage_water_changes_the_independently_calculated_tide_vector() {
             .iter()
             .map(|selection| selection.tide_id)
             .collect::<Vec<_>>(),
-        [1, 2, 2, 2, 1]
+        [1, 1, 2, 1, 1]
     );
 }
 

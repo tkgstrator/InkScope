@@ -453,7 +453,9 @@ fn special_branch_draw_count_changes_the_following_wave() {
     assert_eq!(stored.selections[0].tide_id, 2);
     assert_eq!(stored.selections[1].event_id, 6);
     assert_eq!(stored.selections[1].tide_id, 0);
-    assert_eq!(sentinel.selections[0].tide_id, 1);
-    assert_eq!(sentinel.selections[1].event_id, 2);
-    assert_eq!(sentinel.selections[1].tide_id, 1);
+    // The sentinel consumes three completed native tide draws; the stored
+    // branch consumes none. Their following event/tide selections diverge.
+    assert_eq!(sentinel.selections[0].tide_id, 0);
+    assert_eq!(sentinel.selections[1].event_id, 3);
+    assert_eq!(sentinel.selections[1].tide_id, 2);
 }
