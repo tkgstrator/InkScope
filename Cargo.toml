@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/packet-capture", "crates/ocean-calc"]
+members = ["crates/packet-capture", "crates/ocean-calc", "crates/ocean-calc-wasm"]
 resolver = "3"
 
 [workspace.package]
