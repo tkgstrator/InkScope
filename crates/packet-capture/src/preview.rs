@@ -5,6 +5,7 @@
 //! applied without later overrides.
 
 use crate::decode::Row;
+use crate::equipment::{self, EquipmentPreview, EquipmentSetting};
 use ocean_calc::{
     SeedWords,
     levels::{common_weights, queue_counts},
@@ -25,6 +26,8 @@ pub struct WavePreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub scenarios: Vec<PreviewScenario>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equipment: Option<EquipmentPreview>,
 }
 
 #[derive(Clone, Serialize)]
@@ -34,7 +37,7 @@ pub struct PreviewScenario {
     pub waves: Vec<PreviewWave>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct PreviewWave {
     pub wave_index: u8,
     pub event_id: u8,
@@ -49,6 +52,7 @@ struct Setting {
     job_type: u8,
     difficulty: Option<u32>,
     seed: [u32; 4],
+    equipment: Option<EquipmentSetting>,
 }
 
 #[derive(Default)]
@@ -70,12 +74,25 @@ fn unavailable(reason: impl Into<String>) -> WavePreview {
         assumptions: vec![],
         reason: Some(reason.into()),
         scenarios: vec![],
+        equipment: None,
+    }
+}
+
+// The stock 11.3.0 CoopMapInfo stage class is keyed by exact StageResource.
+// Keep both branches for an unclassified resource rather than guessing.
+fn big_run_modes(stage: &str) -> &'static [bool] {
+    match stage {
+        "Cop_Shakeup" | "Cop_Shakespiral" | "Cop_Shakelift" | "Cop_Shakeship" | "Cop_Shakedent"
+        | "Cop_Shakehighway" | "Cop_Shakerail" => &[false],
+        "Cop_Carousel" | "Cop_Upland" | "Cop_Temple" | "Cop_Factory" | "Cop_Section"
+        | "Cop_District00" | "Cop_Manbou00" => &[true],
+        _ => &[false, true],
     }
 }
 
 impl WavePreviewer {
     /// Returns a preview only for the first confirmed occurrence of each
-    /// stage, job type, difficulty, and four-word GameSeed combination.
+    /// stage, job type, difficulty, GameSeed, and equipment input combination.
     pub fn observe(&mut self, row: &Row) -> Option<WavePreview> {
         if row.status != "authenticated"
             || row.protocol != Some(8)
@@ -98,6 +115,7 @@ impl WavePreviewer {
             job_type,
             difficulty,
             seed,
+            equipment: EquipmentSetting::from_fields(&row.fields),
         };
         if self.seen.contains(&setting) {
             return None;
@@ -106,7 +124,12 @@ impl WavePreviewer {
             self.seen.pop_front();
         }
         self.seen.push_back(setting.clone());
-        Some(calculate(&setting))
+        let mut preview = calculate(&setting);
+        preview.equipment = setting
+            .equipment
+            .as_ref()
+            .map(|input| equipment::calculate(input, setting.job_type, setting.seed));
+        Some(preview)
     }
 }
 
@@ -128,8 +151,8 @@ fn calculate(setting: &Setting) -> WavePreview {
     };
     let seed = SeedWords::from_scene(setting.seed);
     let common = common_weights(difficulty);
-    let mut scenarios = Vec::with_capacity(4);
-    for is_big_run in [false, true] {
+    let mut scenarios = Vec::with_capacity(big_run_modes(&setting.stage).len() * 2);
+    for &is_big_run in big_run_modes(&setting.stage) {
         for (global_word, global_word_class) in [
             (0u32, "global_word >> 8 <= 256"),
             (0x10100u32, "global_word >> 8 > 256"),
@@ -186,6 +209,9 @@ fn calculate(setting: &Setting) -> WavePreview {
         "initial special tide is inactive and nominal queue uses the normal branch",
         "generated values only; later application and actual spawns are unknown",
     ];
+    if big_run_modes(&setting.stage).len() == 1 {
+        assumptions.push("IsBigRun follows the stock 11.3.0 CoopMapInfo stage class");
+    }
     if setting.job_type == 1 {
         assumptions.push("raw MatchMode is 11 (unverified)");
     } else {
@@ -200,6 +226,7 @@ fn calculate(setting: &Setting) -> WavePreview {
         assumptions,
         reason: None,
         scenarios,
+        equipment: None,
     }
 }
 

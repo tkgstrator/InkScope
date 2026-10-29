@@ -36,6 +36,9 @@ impl Endian {
 
 pub struct Reader<R: Read> {
     input: R,
+    global_header: [u8; 24],
+    raw_records: bool,
+    last_record: Vec<u8>,
     endian: Endian,
     nanoseconds: bool,
     record: u64,
@@ -101,14 +104,32 @@ impl<R: Read> Reader<R> {
         }
         Ok(Self {
             input,
+            global_header: header,
+            raw_records: false,
+            last_record: Vec::new(),
             endian,
             nanoseconds,
             record: 0,
         })
     }
 
+    pub fn new_with_raw_records(input: R) -> Result<Self> {
+        let mut reader = Self::new(input)?;
+        reader.raw_records = true;
+        Ok(reader)
+    }
+
+    pub fn global_header(&self) -> &[u8; 24] {
+        &self.global_header
+    }
+
+    pub fn last_record_bytes(&self) -> &[u8] {
+        &self.last_record
+    }
+
     pub fn next_record(&mut self) -> Result<Option<std::result::Result<UdpPacket, String>>> {
         loop {
+            self.last_record.clear();
             let mut header = [0; 16];
             if !exact_or_eof(&mut self.input, &mut header).map_err(|e| e.to_string())? {
                 return Ok(None);
@@ -139,6 +160,11 @@ impl<R: Read> Reader<R> {
                     "record {}: truncated PCAP record body",
                     self.record
                 ));
+            }
+            if self.raw_records {
+                self.last_record.reserve(16 + frame.len());
+                self.last_record.extend_from_slice(&header);
+                self.last_record.extend_from_slice(&frame);
             }
             if captured != original {
                 return Ok(Some(Err(format!(

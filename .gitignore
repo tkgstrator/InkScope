@@ -1,5 +1,8 @@
 /target/
 /dist/
+/captures/
+/ui-demo/node_modules/
+/ui-demo/dist/
 /.codex/
 /.claude/
 /.env

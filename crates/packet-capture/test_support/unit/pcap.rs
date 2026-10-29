@@ -150,3 +150,18 @@ fn captured_shorter_than_wire_is_reported() {
             .contains("caplen < wirelen")
     );
 }
+
+#[test]
+fn exposes_exact_original_pcap_bytes_for_selected_records() {
+    let first = capture(&frame(), false, false);
+    let mut second_frame = frame();
+    second_frame[42..].copy_from_slice(&[4, 5, 6]);
+    let second = capture(&second_frame, false, false);
+    let combined = [&first[..], &second[24..]].concat();
+    let mut reader = Reader::new_with_raw_records(OneByte(Cursor::new(combined))).unwrap();
+    assert_eq!(reader.global_header(), &first[..24]);
+    reader.next_record().unwrap().unwrap().unwrap();
+    assert_eq!(reader.last_record_bytes(), &first[24..]);
+    reader.next_record().unwrap().unwrap().unwrap();
+    assert_eq!(reader.last_record_bytes(), &second[24..]);
+}

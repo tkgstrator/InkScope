@@ -42,13 +42,94 @@ fn setting_row() -> Row {
     }
 }
 
+fn equipment_row() -> Row {
+    let mut row = setting_row();
+    for (name, value) in [
+        ("UnlockedSeason", "4"),
+        ("WeaponIdCount", "4"),
+        ("WeaponId[0]", "22030"),
+        ("WeaponId[1]", "22030"),
+        ("WeaponId[2]", "22030"),
+        ("WeaponId[3]", "22030"),
+        ("ScenarioAppVersion", "721664"),
+        ("ScenarioCompetitionType", "0"),
+        ("ScenarioOriginalWeaponIdCount", "0"),
+    ] {
+        row.fields.push(Field {
+            name: name.into(),
+            value: value.into(),
+            bits: None,
+        });
+    }
+    row
+}
+
 #[test]
-fn first_confirmed_setting_has_four_conditional_scenarios_and_deduplicates() {
+fn equipment_preview_preserves_all_five_fixed_rows_and_conditional_evidence() {
+    let preview = WavePreviewer::default().observe(&equipment_row()).unwrap();
+    let json = serde_json::to_value(preview).unwrap();
+    assert_eq!(json["equipment"]["status"], "conditional");
+    assert_eq!(json["equipment"]["source"], "OnlineCoopSetting");
+    assert_eq!(
+        json["equipment"]["main_weapons"],
+        serde_json::to_value([[22030; 4]; 5]).unwrap()
+    );
+    assert!(
+        !json["equipment"]["assumptions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn changed_equipment_metadata_is_not_deduplicated_as_the_old_setting() {
+    for name in [
+        "UnlockedSeason",
+        "WeaponId[1]",
+        "ScenarioAppVersion",
+        "ScenarioCompetitionType",
+        "ScenarioOriginalWeaponIdCount",
+    ] {
+        let mut previewer = WavePreviewer::default();
+        let mut row = equipment_row();
+        assert!(previewer.observe(&row).is_some());
+        row.fields
+            .iter_mut()
+            .find(|field| field.name == name)
+            .unwrap()
+            .value = match name {
+            "UnlockedSeason" => "3",
+            "WeaponId[1]" => "-1",
+            "ScenarioAppVersion" => "1",
+            _ => "1",
+        }
+        .into();
+        if name == "ScenarioOriginalWeaponIdCount" {
+            row.fields.push(Field {
+                name: "ScenarioOriginalWeaponId[0]".into(),
+                value: "-1".into(),
+                bits: None,
+            });
+        }
+        assert!(previewer.observe(&row).is_some(), "{name}");
+        assert!(previewer.observe(&row).is_none(), "{name}");
+    }
+}
+
+#[test]
+fn regular_stage_has_only_non_big_run_scenarios_and_deduplicates() {
     let mut previewer = WavePreviewer::default();
     let row = setting_row();
     let preview = previewer.observe(&row).expect("first setting");
     assert_eq!(preview.status, "conditional");
-    assert_eq!(preview.scenarios.len(), 4);
+    assert_eq!(preview.scenarios.len(), 2);
+    assert!(
+        preview
+            .scenarios
+            .iter()
+            .all(|scenario| !scenario.is_big_run)
+    );
     assert!(
         preview
             .scenarios
@@ -72,7 +153,21 @@ fn first_confirmed_setting_has_four_conditional_scenarios_and_deduplicates() {
         .value = "5".into();
     assert!(previewer.observe(&changed).is_some());
     let json = serde_json::to_value(preview).unwrap();
-    assert_eq!(json["scenarios"].as_array().unwrap().len(), 4);
+    assert_eq!(json["scenarios"].as_array().unwrap().len(), 2);
+    assert!(json.get("equipment").is_none());
+}
+
+#[test]
+fn big_run_stage_has_only_big_run_scenarios() {
+    let mut row = setting_row();
+    row.fields
+        .iter_mut()
+        .find(|field| field.name == "StageResource")
+        .unwrap()
+        .value = "Cop_Carousel".into();
+    let preview = WavePreviewer::default().observe(&row).unwrap();
+    assert_eq!(preview.scenarios.len(), 2);
+    assert!(preview.scenarios.iter().all(|scenario| scenario.is_big_run));
 }
 
 #[test]

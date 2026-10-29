@@ -1,6 +1,7 @@
 //! Stateful LAN discovery, authenticated Pia decoding, and conservative field labels.
 use crate::Result;
 use crate::crypto::{self, GameKey, PiaKey};
+use crate::equipment::EquipmentSetting;
 use crate::pcap::UdpPacket;
 use crate::preview::WavePreview;
 use serde::Serialize;
@@ -153,6 +154,72 @@ impl Decoder {
         self.requests.clear();
         self.candidates.clear();
         self.rtt_pending.clear();
+    }
+
+    /// Check only the explicitly supplied PiaKey for packets involving its
+    /// requested peer. `None` excludes unrelated or malformed packet layouts;
+    /// it must not be counted as evidence that a cached key is stale.
+    pub fn manual_pia_authentication(&self, packet: &UdpPacket) -> Option<bool> {
+        let (peer, key) = self.manual_pia.as_ref()?;
+        if packet.source_port != 49152 && packet.destination_port != 49152 {
+            return None;
+        }
+        if packet.source != *peer && packet.destination != *peer {
+            return None;
+        }
+        crypto::validate_pia_header(&packet.payload).ok()?;
+        match crypto::decrypt_pia(key, &packet.payload, packet.source) {
+            Ok(_) => Some(true),
+            Err(error) if error == "Pia authentication failed" => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    pub fn discard_manual_pia(&mut self) {
+        self.manual_pia = None;
+    }
+
+    pub fn replace_manual_pia(&mut self, peer: Ipv4Addr, key: PiaKey) {
+        self.manual_pia = Some((peer, key));
+    }
+
+    pub fn manual_pia_key(&self, peer: Ipv4Addr) -> Option<&PiaKey> {
+        let (configured, key) = self.manual_pia.as_ref()?;
+        (*configured == peer).then_some(key)
+    }
+
+    /// The latest key tied to a proof-verified BrowseReply for this host.
+    pub fn verified_pia_key(&self, peer: Ipv4Addr) -> Option<&PiaKey> {
+        self.candidates
+            .get(&peer)?
+            .iter()
+            .rev()
+            .find(|candidate| candidate.verified)
+            .map(|candidate| &candidate.key)
+    }
+
+    /// An automatically derived candidate that authenticates this exact Pia
+    /// packet. A BrowseReply without a verified request can still yield a
+    /// usable key once GCM authentication succeeds.
+    pub fn authenticated_candidate_key(
+        &self,
+        packet: &UdpPacket,
+        peer: Ipv4Addr,
+    ) -> Option<[u8; 16]> {
+        if packet.source != peer && packet.destination != peer {
+            return None;
+        }
+        crypto::validate_pia_header(&packet.payload).ok()?;
+        let manual = self.manual_pia_key(peer);
+        for key in self.keys_for(packet) {
+            if manual.is_some_and(|manual| std::ptr::eq(manual, key)) {
+                continue;
+            }
+            if crypto::decrypt_pia(key, &packet.payload, packet.source).is_ok() {
+                return Some(key.0);
+            }
+        }
+        None
     }
 
     /// Capture-time request-to-response interval, including peer processing and capture effects.
@@ -419,10 +486,18 @@ impl Decoder {
                         .push(field("HeaderCompressedFlag", pia.flags & 1 != 0, None));
                     let semantic = semantic_fields(&chunk);
                     output.layout = Some(
-                        if semantic.len() > 2 {
+                        if semantic.iter().any(|field| {
+                            matches!(
+                                (chunk.protocol, field.name.as_str()),
+                                (11, "ProfileScope" | "StationRosterScope")
+                                    | (13, "SessionRosterScope")
+                            )
+                        }) {
+                            "type_fields"
+                        } else if semantic.len() > 2 {
                             if chunk.protocol == 8
                                 && event_type(&chunk.payload).is_some_and(|id| {
-                                    event_body_bits(id, chunk.payload.len()).is_none()
+                                    event_body_bits(id, &chunk.payload, chunk.port).is_none()
                                 })
                             {
                                 "type_fields"
@@ -565,6 +640,8 @@ fn protocol_name(id: u8) -> &'static str {
 }
 
 fn event_type(payload: &[u8]) -> Option<u32> {
+    // The native wrapper's entry count n is exactly the byte at offset 7.
+    // Only n=0 has the fixed header and event offsets decoded below.
     if payload.len() < 25 || payload[0] != 7 || payload[7] != 0 {
         return None;
     }
@@ -740,6 +817,244 @@ fn axis(bytes: &[u8], start: usize) -> Option<f64> {
     })
 }
 
+fn shot_trig_sample(index: u32) -> (f64, f64) {
+    // Regenerates the native table at 0x50c9fe0 without copying asset data.
+    // Exact cardinal zeros also preserve the native axis-aligned vectors.
+    match index % 256 {
+        0 => (0.0, 1.0),
+        64 => (1.0, 0.0),
+        128 => (0.0, -1.0),
+        192 => (-1.0, 0.0),
+        _ => (f64::from(index) * std::f64::consts::TAU / 256.0).sin_cos(),
+    }
+}
+
+fn shot_interpolated_trig(angle: f32, fused: bool) -> (f32, f32) {
+    // 0x31cbd94..0x31cbe20 converts a signed angle to a wrapping 8-bit
+    // table index and 24-bit fractional part. Pitch uses separate operations;
+    // yaw uses native FMADD. Direct sin/cos(angle) is measurably different.
+    let fixed = (angle * f32::from_bits(0x4e22_f983)) as i64;
+    let index = ((fixed as u64 >> 24) & 255) as u32;
+    let fraction = (fixed as u64 & 0x00ff_ffff) as f32;
+    let (sin, cos) = shot_trig_sample(index);
+    let (next_sin, next_cos) = shot_trig_sample(index + 1);
+    let interpolate = |start: f64, end: f64| {
+        let delta = (end - start) as f32;
+        if fused {
+            delta.mul_add(fraction * f32::from_bits(0x3380_0000), start as f32)
+        } else {
+            start as f32 + (delta * fraction) * f32::from_bits(0x3380_0000)
+        }
+    };
+    (interpolate(sin, next_sin), interpolate(cos, next_cos))
+}
+
+fn shot_velocity(pitch_raw: u32, yaw_raw: u32, length_raw: u32) -> [f32; 3] {
+    // Native direction decoder 0x31cbcb8: signed pitch/2047 * pi/2,
+    // signed yaw/4095 * pi, table interpolation, then normalize once more.
+    let signed = |raw: u32, sign: u32, maximum: f32, angle: f32| {
+        let magnitude = (raw & (sign - 1)) as f32 / maximum;
+        (if raw & sign == 0 {
+            magnitude
+        } else {
+            -magnitude
+        }) * angle
+    };
+    let pitch = signed(pitch_raw, 0x800, 2047.0, std::f32::consts::FRAC_PI_2);
+    let yaw = signed(yaw_raw, 0x1000, 4095.0, std::f32::consts::PI);
+    let y = shot_interpolated_trig(pitch, false).0;
+    let (sin_yaw, cos_yaw) = shot_interpolated_trig(yaw, true);
+    let radius = (1.0 - y * y).sqrt();
+    let x = radius * sin_yaw;
+    let z = radius * cos_yaw;
+    let inverse_norm = 1.0 / z.mul_add(z, x.mul_add(x, y * y)).sqrt();
+    // Preserve 0x379a6cc..0x379a710's f32 evaluation order. The output is
+    // the launch velocity per native frame, not a destination coordinate.
+    let inverse_sixty = f32::from_bits(0x3c88_8889);
+    let magnitude = (length_raw as f32 / 65535.0 * 2048.0 * inverse_sixty) * 60.0;
+    [x, y, z].map(|axis| ((axis * inverse_norm) * magnitude) * inverse_sixty)
+}
+
+fn player_state_axes(fields: &mut Vec<Field>, payload: &[u8], start: usize) {
+    // These three axes match the owned 11.3.0 PlayerNetState serializer's
+    // first fields. Their screen slot and current-world-coordinate meaning
+    // are not established by the packet shape alone.
+    fields.push(field("PlayerStateCoordinateMeaning", "Unknown", None));
+    for (name, offset) in [
+        ("PlayerStateX", 0),
+        ("PlayerStateY", 17),
+        ("PlayerStateZ", 34),
+    ] {
+        if let Some(value) = axis(payload, start + offset) {
+            fields.push(field(
+                name,
+                format!("{value:.3}"),
+                Some([start + offset, start + offset + 17]),
+            ));
+        }
+    }
+    // Owned 11.3.0 PlayerNetState +0x68 is an unsigned affine 12-bit
+    // normalized camera-pitch control, not a sign/magnitude angle. Encoder
+    // 0x27fcb74..0x27fcbdc and decoder 0x27fd7c0..0x27fd804 use 4095;
+    // the decoder evaluates in f64, then stores f32. Sender 0x287e4fc/e504
+    // copies actor-state +0x584 here; Camera 0x28ee4a4/e4a8 copies the same
+    // property to +0x16c, consumed by geometry 0x28f065c -> 0x28eb664.
+    if let Some(raw) = bits(payload, start + 172, 12) {
+        let control = (2.0 * (raw as f64 / 4095.0) - 1.0) as f32;
+        let span = Some([start + 172, start + 184]);
+        fields.push(field("PlayerStateCameraPitchRaw", raw, span));
+        fields.push(field(
+            "PlayerStateCameraPitchControl",
+            format!("{control:.9}"),
+            span,
+        ));
+    }
+    // +0xf8 is the nested-state selector: decoder 0x27fdb00..0x27fdbd8
+    // selects Squid vtable 0x5d2bef8 for 0, Human 0x5d2bdd8 for 1.
+    // These names label nested animation-state codecs. CoopZombie animation
+    // state 0x94 and entry/warp transitions also select Squid, so this is not
+    // an independent current-screen-form flag. Camera +0x17ac is separate.
+    if let Some(form) = bits(payload, start + 318, 1) {
+        fields.push(field(
+            "PlayerStateForm",
+            if form == 0 { "Squid" } else { "Human" },
+            Some([start + 318, start + 319]),
+        ));
+    }
+    // Owned 11.3.0 PlayerNetState encoder 0x27fcb70 calls 0x31cc060 for
+    // object +0x5c: body bits 159..172 carry a horizontal-vector angle.
+    // Decoder 0x27fd700..0x27fd7bc reconstructs [sin(angle), 0, cos(angle)].
+    // Body facing versus aim is still Unknown; do not substitute movement.
+    if let Some(raw) = bits(payload, start + 159, 13) {
+        let magnitude = (raw & 0xfff) as f64 / 4095.0;
+        let sign = if raw & 0x1000 == 0 { 1.0 } else { -1.0 };
+        let radians = sign * magnitude * std::f64::consts::PI;
+        fields.push(field("PlayerStateDirectionMeaning", "Unknown", None));
+        fields.push(field(
+            "PlayerStateHorizontalAngleRaw",
+            raw,
+            Some([start + 159, start + 172]),
+        ));
+        fields.push(field(
+            "PlayerStateHorizontalAngleDeg",
+            format!("{:.6}", radians.to_degrees()),
+            Some([start + 159, start + 172]),
+        ));
+        fields.push(field(
+            "PlayerStateDirectionX",
+            format!("{:.6}", radians.sin()),
+            None,
+        ));
+        fields.push(field(
+            "PlayerStateDirectionZ",
+            format!("{:.6}", radians.cos()),
+            None,
+        ));
+    }
+    // The guarded explicit PlayerNetState layouts carry the concrete actor
+    // resource group immediately before presence and body. This is distinct
+    // from the leading CoopSeqPlayerNetState stats group 1107/1108.
+    value_field(fields, payload, "PlayerStateGroupId", start - 33, 32);
+    // Owned 11.3.0 encoder 0x27fce70..0x27fce90 writes state +0xb4
+    // plus one in five bits; decoder 0x27fda6c..0x27fdaa0 subtracts one.
+    // Keep the -1 sentinel and the neutral matching-value name.
+    if let Some(raw) = bits(payload, start + 304, 5) {
+        fields.push(field(
+            "PlayerStateMatchingValue",
+            raw as i64 - 1,
+            Some([start + 304, start + 309]),
+        ));
+    }
+}
+
+fn standalone_player_state_axes_start(payload: &[u8], group: u64) -> Option<usize> {
+    // The existing shifted checks below are equivalent to the appended
+    // frame's length 619 at bit 235, group 200000/210000 at 247, and present
+    // flag at 279. Its PlayerNetState candidate body starts at bit 280.
+    let marker = match group {
+        1107 => 0x800186a0,
+        1108 => 0x80019a28,
+        _ => return None,
+    };
+    (payload.len() == 109
+        && bits(payload, 0, 1) == Some(1)
+        && bits(payload, 1, 12) == Some(222)
+        && bits(payload, 45, 1) == Some(1)
+        && bits(payload, 72, 3) == Some(4)
+        && bits(payload, 123, 3) == Some(4)
+        && bits(payload, 235, 1) == Some(1)
+        && bits(payload, 236, 12) == Some(309)
+        && bits(payload, 248, 32) == Some(marker)
+        && bits(payload, 866, 6) == Some(0))
+    .then_some(280)
+}
+
+fn nested_host_player_state_axes_start(payload: &[u8]) -> Option<usize> {
+    // The host's 1104 state contains a 1107 frame at bit 75. The shortest
+    // observed composite is 118 bytes and ends after the 586-bit body.
+    (payload.len() >= 118
+        && bits(payload, 0, 1) == Some(1)
+        && bits(payload, 1, 12) == Some(63)
+        && bits(payload, 45, 1) == Some(1)
+        && bits(payload, 75, 1) == Some(0)
+        && bits(payload, 76, 12) == Some(222)
+        && bits(payload, 88, 32) == Some(1107)
+        && bits(payload, 120, 1) == Some(1)
+        && bits(payload, 147, 3) == Some(4)
+        && bits(payload, 198, 3) == Some(4)
+        && bits(payload, 310, 1) == Some(1)
+        && bits(payload, 311, 12) == Some(309)
+        && bits(payload, 323, 32) == Some(0x800186a0)
+        && (payload.len() != 118 || bits(payload, 941, 3) == Some(0)))
+    .then_some(355)
+}
+
+fn nested_host_stats_fields(payload: &[u8], fields: &mut Vec<Field>) {
+    // The global mode bit belongs to the whole P5 payload. The outer 1104
+    // body ends at bit75 (native0x382cf24..0x382cf44); the next frame's
+    // length begins at76. Bit75 is not a second mode and may be either value.
+    if payload.len().saturating_mul(8) < 310
+        || bits(payload, 0, 1) != Some(1)
+        || bits(payload, 1, 12) != Some(63)
+        || bits(payload, 13, 32) != Some(1104)
+        || bits(payload, 45, 1) != Some(1)
+        || bits(payload, 76, 12) != Some(222)
+        || bits(payload, 88, 32) != Some(1107)
+        || bits(payload, 120, 1) != Some(1)
+        || bits(payload, 147, 3) != Some(4)
+        || bits(payload, 198, 3) != Some(4)
+    {
+        return;
+    }
+    for (name, start, width) in [
+        ("NestedStatsFrameLength", 76, 12),
+        ("NestedStatsGroupId", 88, 32),
+        ("NestedStatsPresent", 120, 1),
+        ("NestedStatsIkuraNum", 121, 14),
+        ("NestedStatsHeldGoldenIkuraNum", 135, 12),
+        ("NestedStatsArrayACount", 147, 3),
+        ("NestedStatsArrayBCount", 198, 3),
+    ] {
+        value_field(fields, payload, name, start, width);
+    }
+    for index in 0..4 {
+        value_field(
+            fields,
+            payload,
+            &format!("NestedStatsArrayA[{index}]"),
+            150 + index * 12,
+            12,
+        );
+        value_field(
+            fields,
+            payload,
+            &format!("NestedStatsArrayB[{index}]"),
+            201 + index * 12,
+            12,
+        );
+    }
+}
+
 fn salmon_type(id: u64) -> &'static str {
     match id {
         0 => "SakelienStandard",
@@ -782,24 +1097,46 @@ fn stage_name(resource: &str) -> &'static str {
     match resource {
         "Cop_Shakeup" => "Spawning Grounds",
         "Cop_Shakespiral" => "Sockeye Station",
+        "Cop_Shakelift" => "Salmonid Smokeyard",
+        "Cop_Shakeship" => "Marooner's Bay",
         "Cop_Shakedent" => "Gone Fission Hydroplant",
+        "Cop_Shakehighway" => "Jammin' Salmon Junction",
+        "Cop_Shakerail" => "Bonerattle Arena",
         _ => "Unknown",
     }
 }
 
 // The captured Protocol 8 layouts locate the trailing frame fields. Type ID
 // and fixed leading fields are interpreted independently of the total length.
-fn event_body_bits(id: u32, length: usize) -> Option<usize> {
-    match (id, length) {
-        (0x9a1e036d, 211) => Some(1459),
-        (0x0caefc01, 89) => Some(481),
-        (0x6e7d7386, 60) => Some(252),
-        (0x5b64bbf1, 38) => Some(73),
-        (0xedbcbb02, 37) => Some(69),
-        (0xf010cc79, 53) => Some(195),
-        (0x3d8d2c59, 29) => Some(4),
-        _ => None,
+fn event_body_bits(id: u32, payload: &[u8], port: Option<u8>) -> Option<usize> {
+    if matches!(id, 0xf010cc79 | 0x1a894818) && port != Some(100) {
+        return None;
     }
+    let body_bits = match (id, payload.len()) {
+        (0x9a1e036d, 211) if EquipmentSetting::from_payload(payload).is_some() => 1459,
+        (0x0caefc01, 89) => 481,
+        (0x6e7d7386, 60) => 252,
+        (0x5b64bbf1, 38) => 73,
+        (0xedbcbb02, 37) => 69,
+        (0xf010cc79, 53) => 195,
+        (0x1a894818, 33) => 36,
+        (0x3d8d2c59, 29) => 4,
+        (0x4939c1ac, 48) => 154,
+        (0xe3f0eb9a, 48) => 155,
+        // Owned 11.3.0 exact Coop lifecycle / round-setup codecs.
+        (0xcf9be194, 29) => 4,
+        (0x74400e72, 43) => 110,
+        (0x89e91844, 39) => 78,
+        (0x4c4d2b61, 29) => 2,
+        _ => return None,
+    };
+    if matches!(id, 0xcf9be194 | 0x74400e72 | 0x89e91844 | 0x4c4d2b61) {
+        let padding_start = 200 + body_bits + 27;
+        if bits(payload, padding_start, payload.len() * 8 - padding_start) != Some(0) {
+            return None;
+        }
+    }
+    Some(body_bits)
 }
 
 fn semantic_fields(chunk: &Chunk) -> Vec<Field> {
@@ -862,17 +1199,130 @@ fn semantic_fields(chunk: &Chunk) -> Vec<Field> {
                     value_field(&mut fields, p, "Quota", 49, 6);
                     value_field(&mut fields, p, "BaselineA", 55, 10);
                     value_field(&mut fields, p, "BaselineB", 65, 10);
+                    if chunk.port == Some(101) {
+                        nested_host_stats_fields(p, &mut fields);
+                    }
+                    if chunk.port == Some(101)
+                        && let Some(start) = nested_host_player_state_axes_start(p)
+                    {
+                        player_state_axes(&mut fields, p, start);
+                    }
                 } else {
                     value_field(&mut fields, p, "ArrayACount", 72, 3);
                     value_field(&mut fields, p, "ArrayBCount", 123, 3);
+                    // Preserve the existing generic array field names. Named
+                    // participant scalars require this complete count-four shape.
+                    // The 222-bit frame begins after the 13-bit mode/length header;
+                    // the authenticated chunk may contain more data after that frame.
+                    if bits(p, 1, 12) == Some(222)
+                        && p.len() * 8 >= 13 + 222
+                        && bits(p, 45, 1) == Some(1)
+                        && bits(p, 72, 3) == Some(4)
+                        && bits(p, 123, 3) == Some(4)
+                    {
+                        value_field(&mut fields, p, "IkuraNum", 46, 14);
+                        value_field(&mut fields, p, "HeldGoldenIkuraNum", 60, 12);
+                        for index in 0..4 {
+                            value_field(
+                                &mut fields,
+                                p,
+                                &format!("ArrayA[{index}]"),
+                                75 + index * 12,
+                                12,
+                            );
+                            value_field(
+                                &mut fields,
+                                p,
+                                &format!("ArrayB[{index}]"),
+                                126 + index * 12,
+                                12,
+                            );
+                        }
+                    }
+                    if chunk.port == Some(101)
+                        && let Some(start) = standalone_player_state_axes_start(p, group)
+                    {
+                        player_state_axes(&mut fields, p, start);
+                    }
                 }
             }
         },
         8 if p.len() >= 25 && p[0] == 7 => {
             if let Some(id) = event_type(p) {
                 fields.push(field("TypeId", format!("0x{id:08x}"), Some([168, 200])));
-                let confirmed = event_body_bits(id, p.len());
+                let confirmed = event_body_bits(id, p, chunk.port);
                 match id {
+                    0xcf9be194 if confirmed == Some(4) => {
+                        let index = bits(p, 200, 4).expect("complete rescued body") as i64 - 1;
+                        fields.push(field("RescuerIndex", index, Some([200, 204])));
+                    },
+                    0xf010cc79 if confirmed == Some(195) => {
+                        // 0x379a090/0x379a590 encode/decode the complete shot.
+                        // The receiver copies XYZ A into BulletGoldenIkura's
+                        // creation position. XYZ B is a separate input, not a
+                        // proven landing point; keep that triple neutral.
+                        for (name, start) in [
+                            ("ShotStartX", 200),
+                            ("ShotStartY", 217),
+                            ("ShotStartZ", 234),
+                            ("ShotOtherX", 292),
+                            ("ShotOtherY", 309),
+                            ("ShotOtherZ", 326),
+                        ] {
+                            if let Some(value) = axis(p, start) {
+                                fields.push(field(
+                                    name,
+                                    format!("{value:.3}"),
+                                    Some([start, start + 17]),
+                                ));
+                            }
+                        }
+                        // Direction helper 0x31cbac0 writes 12 then 13 bits;
+                        // 0x31cc354 follows it with a 16-bit magnitude.
+                        value_field(&mut fields, p, "ShotVectorRawA", 251, 12);
+                        value_field(&mut fields, p, "ShotVectorRawB", 263, 13);
+                        value_field(&mut fields, p, "ShotVectorLengthRaw", 276, 16);
+                        let velocity = shot_velocity(
+                            bits(p, 251, 12).expect("confirmed shot direction") as u32,
+                            bits(p, 263, 13).expect("confirmed shot direction") as u32,
+                            bits(p, 276, 16).expect("confirmed shot magnitude") as u32,
+                        );
+                        for (name, value) in ["ShotVelocityX", "ShotVelocityY", "ShotVelocityZ"]
+                            .into_iter()
+                            .zip(velocity)
+                        {
+                            fields.push(field(name, format!("{value:.6}"), Some([251, 292])));
+                        }
+                        value_field(&mut fields, p, "ShotValueRaw", 343, 16);
+                        value_field(&mut fields, p, "ShotValuePlusOne", 359, 4);
+                        value_field(&mut fields, p, "ShotItemId", 363, 32);
+                    },
+                    0x1a894818 if confirmed == Some(36) => {
+                        // 0x3799740/0x3799808: identity32 + plus-one4.
+                        // This event contains no position or landing field.
+                        value_field(&mut fields, p, "SleepItemId", 200, 32);
+                        value_field(&mut fields, p, "SleepValuePlusOne", 232, 4);
+                    },
+                    0x4939c1ac | 0xe3f0eb9a
+                        if confirmed
+                            .is_some_and(|body_bits| p.len() * 8 >= 200 + body_bits + 27) =>
+                    {
+                        // Both paint-event encoders begin with three 17-bit axes.
+                        // Keep the next two 12-bit values raw: the ELF stores
+                        // each as a float after scaling by 64.0 / 4095.0,
+                        // while their gameplay meanings remain unknown.
+                        for (name, start) in [("PaintX", 200), ("PaintY", 217), ("PaintZ", 234)] {
+                            if let Some(value) = axis(p, start) {
+                                fields.push(field(
+                                    name,
+                                    format!("{value:.3}"),
+                                    Some([start, start + 17]),
+                                ));
+                            }
+                        }
+                        value_field(&mut fields, p, "PaintScalarRawA", 251, 12);
+                        value_field(&mut fields, p, "PaintScalarRawB", 263, 12);
+                    },
                     0x0caefc01 if p.len() * 8 >= 333 => {
                         for (name, start) in [("SpawnX", 200), ("SpawnY", 217), ("SpawnZ", 234)] {
                             if let Some(value) = axis(p, start) {
@@ -910,6 +1360,9 @@ fn semantic_fields(chunk: &Chunk) -> Vec<Field> {
                         value_field(&mut fields, p, "LinkNibble", 393, 4);
                     },
                     0x9a1e036d if p.len() * 8 >= 1203 => {
+                        if let Some(equipment) = EquipmentSetting::from_payload(p) {
+                            fields.extend(equipment.fields());
+                        }
                         if let Some(stage) = p.get(25..89) {
                             let end = stage.iter().position(|v| *v == 0).unwrap_or(stage.len());
                             if end > 0 && stage[..end].iter().all(|v| v.is_ascii_graphic()) {
@@ -947,9 +1400,16 @@ fn semantic_fields(chunk: &Chunk) -> Vec<Field> {
                     value_field(&mut fields, p, "GameFrame", 200 + body_bits, 23);
                     value_field(&mut fields, p, "LifeNumber", 223 + body_bits, 4);
                 }
+                value_field(&mut fields, p, "EventResourceGroupId", 136, 32);
             }
         },
         11 => {
+            if let Some(profiles) = crate::station_profile::fields(p) {
+                fields.extend(profiles);
+            }
+            if let Some(roster) = crate::station_profile::roster_fields(p) {
+                fields.extend(roster);
+            }
             if let Some(setting) = private_setting(chunk) {
                 if let Some(stage_id) = setting.stage_id {
                     fields.push(field("StageId", stage_id, Some([100, 612])));
@@ -960,6 +1420,11 @@ fn semantic_fields(chunk: &Chunk) -> Vec<Field> {
                         fields.push(field("Difficulty", wire - 1, None));
                     }
                 }
+            }
+        },
+        13 => {
+            if let Some(roster) = crate::station_profile::session_roster_fields(p) {
+                fields.extend(roster);
             }
         },
         _ => {},
