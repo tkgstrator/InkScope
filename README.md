@@ -1,174 +1,278 @@
 # InkScope
 
-Splatoon 3 (0100C2500FC20000) の LAN Play パケットをキャプチャーし、コンソールに表示するアプリケーションです。鍵を指定すると復号結果も表示できます。鍵はリポジトリに含みません。ocean-calc を使って WAVE 情報を先読みできます。
+Splatoon 3（`0100C2500FC20000`）のLAN Play通信（Piaプロトコル / UDP 35000, 49152）をリアルタイムにキャプチャ・認証・復号し、コンソールやWeb UIに表示するツールです。
 
-## 使い方
+- **パケットキャプチャ＆リアルタイム復号**: 部屋発見（Browse）からPia暗号鍵を自動導出してゲーム中パケットを復号・解析。
+- **WAVE情報の先読み**: シーンシードからイベント・潮位・名目オオモノ出現時刻を事前計算（`ocean-calc` 連携）。
+- **HDMI映像と通信の同期保存**: 1080p 60fpsのロスレスPNG画面とPCAP・復号JSONLを試合単位（UUID）で記録。
+- **Visualizer連携**: ローカルのInkScope Visualizerと連携し、LIVE表示・Replay再生・Settingsからの安全な鍵管理に対応。
 
-~~~sh
+> [!NOTE]
+> 本リポジトリに暗号鍵ファイルは含まれません。利用には所有するゲーム環境から取得した正規の鍵が必要です。
+
+---
+
+## 目次
+
+1. [ビルド手順](#ビルド手順)
+2. [基本的な使い方](#基本的な使い方)
+3. [開発・継続取得スクリプト (capture.sh)](#開発継続取得スクリプト-capturesh)
+4. [ゲーム内HDMI画像と通信の同期保存](#ゲーム内hdmi画像と通信の同期保存)
+5. [Visualizer連携](#visualizer連携)
+6. [コマンド・オプション一覧](#コマンドオプション一覧)
+7. [プロトコル対応状況](#プロトコル対応状況)
+8. [OS別の実行要件](#os別の実行要件)
+
+---
+
+## ビルド手順
+
+Rust（Cargo）ツールチェーンが必要です。
+
+```sh
+# ワークスペース全体のリリースビルド
 cargo build --release --locked --workspace
+
+# バイナリを作業用ディレクトリへ配置
 mkdir -p dist
 install -m 755 target/release/inkscope dist/inkscope
 install -m 755 target/release/ocean-calc dist/ocean-calc
+
+# ビルド成果物の一時ファイルを削除（任意）
 cargo clean
-~~~
+```
 
-保存した PCAP を解析します。PCAP・参照表のパスと MAC アドレスは手元の値に変更してください。
+---
 
-~~~sh
+## 基本的な使い方
+
+### 1. 保存済みPCAPの解析 (`inspect`)
+
+既存のPCAPファイルを読み込み、通信構造や復号本文を表示します。
+
+```sh
 dist/inkscope inspect "$HOME/captures/capture.pcap" \
   --random-table "$HOME/.config/inkscope/table.bin" \
   --target-mac 02:00:00:00:00:01
-~~~
+```
 
-macOS では、初回に `brew install --cask wireshark-chmodbpf` を実行して再起動すると、通常ユーザーで BPF にアクセスできます。インストール時には管理者認証が必要です。リピーターハブに接続した有線 NIC から保存しながら解析する例:
+### 2. 有線NICからのライブキャプチャ (`capture`)
 
-~~~sh
+ネットワークインターフェースを指定して直接キャプチャと解析を行います。
+
+```sh
 mkdir -p "$HOME/captures"
 dist/inkscope capture --interface en18 \
   --output "$HOME/captures/capture.pcap" \
   --random-table "$HOME/.config/inkscope/table.bin" \
   --target-mac 02:00:00:00:00:01
-~~~
+```
 
-開発中に最新のデバッグビルドで継続取得する場合は、このリポジトリで `./capture.sh` を実行します。既定の `normal` モードは取得対象の全パケットを新しい PCAP に保存します。`--mode debug` でも全パケットを保存し、`--mode salmon` は認証済みの既知 Salmon Run パケットと対象のプレイヤー復活・デス通知を保存します。起動時とソース・Cargo 設定・ビルド入力の変更時にビルドし、成功したときだけ新しいキャプチャを起動してから、このスクリプトが起動した前のキャプチャを停止します。ビルドに失敗した場合は前のキャプチャを続けます。キャプチャが予期せず終了した場合は、最後にビルドが成功したバイナリから間隔を空けて再起動します。再起動ごとに新しい 0600 の PCAP を `$HOME/captures` に保存し、Ctrl-C でこのスクリプトが起動したプロセスだけを止めます。別の端末で既に動いているキャプチャは操作しないため、重複を避ける場合は先にその端末で停止してください。`./capture.sh --build-only` は取得を始めずビルドだけを確認します。
+> [!TIP]
+> **macOS での権限設定**:
+> 一般ユーザーでパケットキャプチャを行うには、初回のみ `brew install --cask wireshark-chmodbpf` を実行してOSを再起動してください（インストール時に管理者権限が必要です）。
 
-同じ Mac の `../InkScope-Visualizer/.env.local` に `INKSCOPE_VISUALIZER_TOKEN` が設定されていれば、`capture.sh` は保存と同時に解析イベントを Visualizer の LIVE へ送ります。同ファイルに `INKSCOPE_CONTROL_TOKEN` もあれば、Settings 用の制御 API を `127.0.0.1:10254` で起動します（`INKSCOPE_CONTROL_PORT` で変更可）。起動時の GameKey ファイルは制御 API から変更できず、Settings では鍵を再入力せずに接続します。PCAP の保存先は引き続き非公開の `$HOME/captures` です。Visualizer は PCAP ディレクトリを監視しません。送信済みイベントは Visualizer の PostgreSQL にも保存され、Replay のセッション一覧から選択できます。既に動いている `capture.sh` には変更が反映されないため、その端末で停止して再起動してください。
+---
 
-スクリプトの既定値はインターフェース `en18`、通信相手 `192.168.1.180`、保存・表示モード `normal` です。必要なら `INKSCOPE_INTERFACE`、`INKSCOPE_PEER`、`INKSCOPE_MODE`、`INKSCOPE_CAPTURE_DIR` を環境変数で変更できます。`--mode` 引数は `INKSCOPE_MODE` より優先します。GameKey は `$HOME/.config/inkscope/game_key.bin`、保存する PiaKey は `$HOME/.config/inkscope/pia_key.bin` を使います。
+## 開発・継続取得スクリプト (`capture.sh`)
 
-## ゲーム内のHDMI画像と通信を保存
+開発時にソースコードの変更を監視し、自動リビルドと安全なキャプチャ再起動を行うスクリプトです。
 
-macOSではFFmpegのAVFoundationデバイス名または番号を指定できます。デバイス一覧は鍵なしで照会できます。
+```sh
+./capture.sh
+```
 
-~~~sh
+### 主な特徴と動作仕様
+
+- **安全なホットリロード**:
+  ソースコードやCargo設定の変更を検知するとバックグラウンドでビルドを実行します。ビルドに成功した場合のみ新しいキャプチャプロセスを起動し、正常稼働を確認してから古いプロセスを停止します（ビルド失敗時は既存のキャプチャを中断しません）。
+- **クラッシュ時の自動復帰**:
+  キャプチャプロセスが予期せず終了した場合は、直前の正常バイナリを用いてバックオフ間隔を空けて自動再起動します。
+- **排他制御とファイル保護**:
+  再起動ごとにパーミッション `0600` の新しいPCAPファイルを `$HOME/captures` に生成します。Ctrl-C でスクリプトが自身で起動したプロセスのみを停止し、他の端末で実行中のキャプチャには影響を与えません。
+- **ビルド事前確認**:
+  `./capture.sh --build-only` を実行すると、キャプチャを開始せずにビルドの成否のみをテストできます。
+
+### 取得モード (`--mode`)
+
+- `normal`（既定）: 取得対象の全パケットを新しいPCAPに保存します（ノイズとなる一部制御パケットは画面表示のみ省略）。
+- `debug`: 全パケットを保存し、コンソールにも全パケットの詳細を出力します。
+- `salmon`: 認証済みのサーモンラン通信、およびプレイヤーの復活・デス通知のみを選別してPCAPに保存します。
+
+### インターフェース自動判定と環境変数 (macOS)
+
+macOS では通信相手（デフォルト: `192.168.1.180`）へのルーティング情報に基づき、同一ネットワークに直結されている有効な `en` デバイスを自動選択します（VPNや仮想NIC、別ネットワークへのゲートウェイしかない場合は誤動作を防ぐため起動を中断します）。
+
+ミラーポート等でIPを持たないNICを明示指定する場合は、環境変数で上書きしてください。
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `INKSCOPE_INTERFACE` | 自動判定 | キャプチャ対象のNIC名（例: `en13`） |
+| `INKSCOPE_PEER` | `192.168.1.180` | 通信相手のSwitchのIPv4アドレス |
+| `INKSCOPE_MODE` | `normal` | 動作モード（`normal`, `debug`, `salmon`。コマンド引数 `--mode` が優先） |
+| `INKSCOPE_CAPTURE_DIR` | `$HOME/captures` | PCAPファイルの保存先ディレクトリ |
+
+- **鍵の参照先**:
+  GameKey: `$HOME/.config/inkscope/game_key.bin`  
+  PiaKeyキャッシュ: `$HOME/.config/inkscope/pia_key.bin`（パーミッション `0600`）
+
+---
+
+## ゲーム内HDMI画像と通信の同期保存
+
+HDMIキャプチャデバイスからの非圧縮映像とパケット通信を、試合単位のUUIDディレクトリへ同時記録します。
+
+### 実行例
+
+```sh
+# 利用可能なHDMIキャプチャデバイスの一覧表示（鍵不要）
 dist/inkscope hdmi-devices
+
+# HDMI映像とパケットの同時キャプチャ開始
 dist/inkscope capture --interface en18 \
   --hdmi-device "HDMI capture device" \
   --in-game-dir "$HOME/captures/in_game" \
   --game-key-file "$HOME/.config/inkscope/game_key.bin"
-~~~
+```
 
-`--interface`とデバイス名は実環境に合わせてください。部屋の探索前から起動します。途中から復号する場合は、通常と同じくその部屋の`--pia-key-file`と`--peer`が必要です。`--hdmi-device`と通常の単一PCAP用`--output`は併用しません。`--in-game-dir`を省略すると現在のディレクトリの`captures/in_game`へ保存します。
+### 保存ディレクトリ構造
 
-~~~text
+```text
 captures/in_game/<UUID>/
-  capture.pcap
-  packets.jsonl
-  manifest.json
-  screeshots/
+  capture.pcap          # 試合中の暗号化パケット通信
+  packets.jsonl         # 認証・復号済みフィールドとPCAPレコード番号の対応
+  manifest.json         # 機器設定、実保存フレーム数、終了理由
+  screeshots/           # 各フレームの非圧縮PNG画像（※綴りは仕様準拠）
     segment-000001-<UNIXマイクロ秒>.png
     segment-000002-<UNIXマイクロ秒>.png
-~~~
+```
 
-`screeshots`は保存先として指定された綴りです。認証済みの正しい`OnlineCoopSetting`で試合IDを作り、ホストからの正しい`CoopSequenceNetState`で画像保存を開始します。`CoopSeqRoundFinishEvent`で停止し、同じSequenceの残留通信では再開せず、新しいSequenceで次WAVEを同じUUIDへ保存します。ロビーの`PrivateSetting`だけでは開始しません。`Session 5/6`を終了やクリアと解釈しません。
+### ライフサイクルとトリガー条件
 
-HDMI記録時の`--mode`と`--hide-cycle`は表示を選別し、UUID内の保存区間は変えません。HDMI未指定の単一PCAP保存は従来の動作です。
+- **開始条件**:
+  部屋探索前からキャプチャを起動しておきます。認証済みの `OnlineCoopSetting` 受信時にセッションUUIDを発行し、ホストからの正規な `CoopSequenceNetState` を受信した瞬間に画像保存を開始します（ロビー待機中の `PrivateSetting` や事前ハンドシェイクでは画像保存は開始されません）。
+- **WAVE進行と終了**:
+  各WAVEの終了（`CoopSeqRoundFinishEvent`）で画像保存を一時停止します。次WAVE開始時は同一UUIDディレクトリ内に連番で保存を再開します（WAVE間およびリザルト画面は保存されません）。
+- **中断・閉鎖判定**:
+  ゲーム状態パケットが2秒間途絶した場合は不完全な記録として停止します。また、120秒間の無通信、新しい開始設定、または明示的な停止操作によってセッションが正常にクローズされます。
 
-WAVE中は対象ホスト／クライアントのUDP 49152レコードを元のバイト・PCAP時刻で保存し、開始・WAVE終了の通知も含めます。WAVE間と結果画面は画像を保存しません。正しい終了通知が欠落した場合は、ゲーム状態・既知イベントが2秒途絶すると不完全な記録として停止します。待機・停止中のセッションは120秒の無通信、新しい開始設定、ロビー設定、明示停止で閉じます。これらは通信に基づく区間であり、画面上の厳密なプレイ境界やクリア判定ではありません。`manifest.json`に閉鎖理由と不完全状態を残します。
+### 映像仕様と容量に関する注意
 
-要求するHDMI入力モードの既定は1920×1080・60fpsで、`--hdmi-video-size`と`--hdmi-framerate`で変更できます。入力モードをそのままPNGに保存し、リサイズ・WebP変換・出力fpsの複製は行いません。PNGの圧縮レベルは0、予測はなしです。入力のUYVYからRGBへの変換とPNG符号化は必要です。60fpsの保存成立はデバイス・CPU・ストレージに依存します。1080p・RGB・60fpsの圧縮なし画像本体は約373MB/秒となるため、保存容量とmanifestの実フレーム数・PNG枚数を確認してください。
+- **既定設定**: 1920×1080・60fps（`--hdmi-video-size` と `--hdmi-framerate` で変更可能）。
+- **画像形式**: 入力UYVYからRGBへ変換した圧縮なしPNG（圧縮レベル0）。
+- **帯域・ストレージ要件**:
+  1080p / RGB / 60fpsの非圧縮記録では**約373 MB/秒**のデータが生成されます。ディスク空き容量と書き込み速度を事前にご確認ください。
+- **時刻情報**:
+  画像ファイル名のタイムスタンプは、ホストPCがFFmpeg経由で入力を受け取ったUNIXマイクロ秒（wallclock）です。露光時刻やゲーム内フレーム（`GameFrame`）そのものではなく、キャプチャ機器の伝送遅延を含みます。
 
-画像名の時刻はFFmpegが入力を受けたホストwallclock由来のUNIXマイクロ秒です。HDMI露光時刻やゲーム内`GameFrame`ではなく、映像経路の遅延は未校正です。`packets.jsonl`は元のレコード番号と保存PCAP内の番号を対応させ、当時の認証済み復号フィールドを残します。鍵交換を除くPCAP単独では後から復号できない場合があるため、学習生成にはこのJSONLとmanifestを利用できます。鍵はデータセットへ保存しません。PNG数とFFmpegの報告数の不一致、取得停止・書込エラーは不完全として扱い、所有する取得プロセスを停止します。
+---
 
-## コマンド・オプション
+## Visualizer連携
 
-`inspect PCAP` は既存の classic PCAP を解析します。`capture` は macOS、Linux、Windows の有線 NIC から保存しながら解析します。`export-table --elf FILE --output FILE` は確認済み 11.3.0 ELF から参照表を作り、ほかの鍵源は受け付けません。
+ローカルで起動した [InkScope Visualizer](file:///Users/devonly/Developer/personal/InkScope-Visualizer) とWebSocket経由で接続し、リアルタイム表示や過去セッションの再生を行えます。
 
-| オプション・引数 | 説明 |
-| --- | --- |
-| `inspect PCAP` | 読み込む PCAP のパス。`inspect` で必須 |
-| `--interface IF` | 取得する NIC 名。Windows では `dumpcap -D` の番号も指定可能。`capture` で必須 |
-| `--output FILE` | 単一PCAPの保存先。HDMI未指定の`capture`、または`export-table`で必須。既存ファイルは上書きしない |
-| `hdmi-devices` | macOSのAVFoundationデバイス一覧。鍵・パケット取得は不要 |
-| `capture --hdmi-device DEVICE` | macOSのHDMIデバイス名または番号。ゲーム内のUUIDディレクトリへPNGとPCAPを保存 |
-| `--in-game-dir DIR` | HDMI記録のルート。既定`captures/in_game`、HDMI指定時のみ使用 |
-| `--hdmi-framerate FPS` | HDMI入力に要求するfps。既定60。実保存fpsの保証ではない |
-| `--hdmi-video-size WIDTHxHEIGHT` | HDMI入力モード。既定1920x1080。リサイズはしない |
-| `--ffmpeg FILE` | HDMI取得・デバイス一覧で使うFFmpeg実行ファイル。既定`ffmpeg` |
-| `--random-table FILE` | 272 バイトの外部参照表から GameKey を計算。現実装では 11.3.0 の確認済み GameKey に一致する表のみ受け付ける |
-| `--game-key HEX` | 32 桁の 16 進 GameKey。`--game_key` も同じ指定 |
-| `--game-key-file FILE` | 16 バイトの生 GameKey を読み込む |
-| `--elf FILE` | 確認済み 11.3.0 ELF から GameKey を計算。`export-table` では必須 |
-| `--pia-key-file FILE` | 途中から記録した通信向けに、16 バイトの生 PiaKey を読み込む。`--peer` と併用 |
-| `--peer IPv4` | 手動指定した PiaKey の通信相手。`--pia-key-file` と併用 |
-| `--broadcast-ip IPv4` | ブロードキャスト IP の自動推定を上書きし、BrowseRequest と BrowseReply の認証に使う |
-| `--target-mac MAC` | 対象機の MAC を基準に送受信方向を表示。`--target-ip` とは併用不可 |
-| `--target-ip IPv4` | 対象機の IPv4 を基準に送受信方向を表示。`--target-mac` とは併用不可 |
-| `--jsonl` | 1 行 1 JSON オブジェクトで出力。送受信アドレスと全フィールドを含む |
-| `--mode MODE` | `normal`（既定）は RTTProtocol、Empty、識別できない BroadcastReliableProtocol、GroupId を確認できない UnreliableProtocol を省略。Protocol 5 の GroupId 1104・1107・1108 と認証済み PrivateSetting は表示する。`debug` は全行を表示する。`salmon` は認証済みの既知 Salmon Run 行と対象のプレイヤー復活・デス通知を表示し、`capture` では該当する元の PCAP レコードだけを保存する |
-| `--details` | 通常表示に全フィールド、ビット範囲、復号済み本文の HEX、先読みの名目 tick などを追加。JSONL にはヘッダーの送受信 ID と本文 HEX を追加 |
-| `--hide-cycle` | `--mode debug` で、対応する応答から遅延を計算できた RTTProtocol 行を残し、他の RTTProtocol と本文未確認の UnreliableProtocol を省略 |
-| `--visualizer-url URL` | 解析イベントをローカルの InkScope Visualizer に WebSocket 送信。`INKSCOPE_VISUALIZER_TOKEN` と併用 |
-| `capture --control-port PORT` | `127.0.0.1` に鍵制御 API を起動。`INKSCOPE_CONTROL_TOKEN` と併用 |
-| `-h`、`--help` | ヘルプを表示 |
-
-`inspect` と `capture` では通常、`--random-table`、`--game-key`、`--game-key-file`、`--elf` のちょうど1つが必要です。`capture --control-port` の場合だけ、鍵なしで起動して後から Visualizer の Settings で登録できます。起動時に指定した鍵は制御 API から上書きできません。登録・解除は次の有効な UDP レコードを処理する直前に反映されます。別バージョンの GameKey は `--game-key` または `--game-key-file` で指定できますが、そのバージョンの本文解析は未検証です。鍵ファイルと参照表は利用者本人だけが読める権限で保管してください。`--game-key` はシェル履歴・プロセス引数に残ります。`--mode` と `--hide-cycle` の省略設定は `--jsonl` にも適用されます。方向の `->` は対象からの送信、`<-` は対象への送信です。
-
-## Visualizer 接続
-
-Visualizer を `127.0.0.1:10252` で起動し、両プロセスに同じ `INKSCOPE_VISUALIZER_TOKEN` を設定します。Settings から GameKey を登録する場合は、別の `INKSCOPE_CONTROL_TOKEN`（32 文字以上の秘密の ASCII 文字列）を両プロセスへ設定します。鍵をコマンドライン引数に載せずに起動する例です。
-
-~~~sh
+```sh
 dist/inkscope capture --interface en18 \
   --output "$HOME/captures/capture.pcap" \
   --visualizer-url ws://127.0.0.1:10252/api/ingest \
   --control-port 10254
-~~~
+```
 
-PCAP 保存は表示用のフィルターと独立しており、`--mode normal` でも取得対象の全パケットを保存します。テキスト表示では、確認済みの Protocol 5 状態を `CoopSequenceNetState GroupId=1104 ...`、`CoopSeqPlayerNetState GroupId=1107 ...` のように示します。GroupId を確認できない行に推測値は付けません。JSONL の `kind` にも識別済みの状態名が残ります。`CaptureResponseDelayMs` は認証済み RTTProtocol 要求から対応する応答までのキャプチャ時刻の差で、送信側の `ElapsedMicroseconds` や通信路だけの RTT とは異なります。
+- **リアルタイム表示 (LIVE)**:
+  `../InkScope-Visualizer/.env.local` に `INKSCOPE_VISUALIZER_TOKEN` を設定することで、キャプチャと同時に解析イベントがVisualizerへストリーミング送信されます。
+- **安全な鍵管理 (Settings API)**:
+  `INKSCOPE_CONTROL_TOKEN`（32文字以上の秘密文字列）を設定して `--control-port 10254` を起動すると、VisualizerのSettings画面からWeb経由でGameKeyを登録できます。コマンドライン引数やプロセスリストに秘密鍵を残さずに運用可能です。
+- **リプレイ再生 (Replay)**:
+  送信されたイベントはVisualizer背後のPostgreSQLに蓄積され、過去のセッションを選択して再生・検証できます。
 
-`capture --mode salmon` は例外的に PCAP 保存も選別します。認証できた `Coop...`、`PlayerNetEvent::Coop...`、`OnlineCoopSetting`、`PrivateSetting`、および正確な名前の `PlayerNetEvent::Revival`・`PlayerNetEvent::TroubleDie` の行がある UDP レコードを、元の暗号化済みバイト列のまま保存します。対象には汎用のプレイヤー通知2種を含みます。1 つの UDP に複数の行がある場合はレコード全体を保存します。鍵交換用の Browse 通信や識別できない通信は含めません。出力は classic PCAP として開けますが、後から `inspect` で復号するにはその部屋の PiaKey を別途 `--pia-key-file` と `--peer` で渡す必要があります。`inspect` 自体が復号表示を行うため、追加の `decrypt` コマンドは不要です。鍵が不足している間は関連パケットも選別できません。該当レコードがなければ 24-byte ヘッダーだけの PCAP になります。取得対象の全記録を残したい場合は `normal` または `debug` を使ってください。
+---
 
-Protocol 5 の GroupId 1107/1108 の 109-byte 形と GroupId 1104 内の 1107 入れ子形について、所有する 11.3.0 ELF の `PlayerNetState` encoder と形が一致する先頭三軸を `PlayerStateX/Y/Z` として抽出します。行には `PlayerStateCoordinateMeaning=Unknown` を付けます。GroupId と通信元で観測ストリームを区別できますが、画面の P1〜P4 枠や現在のワールド座標との対応は未検証です。四人の位置として表示・集計しないでください。
+## コマンド・オプション一覧
 
-`OnlineCoopSetting` の通常表示では GameFrame、StageResource、StageName、JobType、Difficulty と4語の GameSeed を各項目1行ずつ表示します。HeaderPacketId、HeaderCompressedFlag、PayloadBytes、TypeId、DifficultyWire、値が0の LifeNumber は通常表示から省き、`--details` と JSONL には保持します。`GameSeed[0]`〜`GameSeed[3]` は順番どおり、テキストでは `0x` 付き8桁の HEX で表示します。JSONL の値はデコーダーの十進表記のままです。
+| オプション・引数 | 必須条件 | 説明 |
+| --- | :---: | --- |
+| `inspect PCAP` | `inspect` 時必須 | 解析するPCAPファイルのパス |
+| `--interface IF` | `capture` 時必須 | キャプチャ対象の有線NIC名（Windowsでは `dumpcap -D` の番号） |
+| `--output FILE` | 通常 `capture` 必須 | PCAPファイルの保存先パス（既存ファイルは上書き不可） |
+| `hdmi-devices` | - | macOS AVFoundationのHDMIデバイス一覧を表示（鍵不要） |
+| `--hdmi-device DEVICE` | HDMI保存時 | HDMIキャプチャデバイス名または番号。UUIDディレクトリへ保存 |
+| `--in-game-dir DIR` | - | HDMI記録の保存ルート（既定: `captures/in_game`） |
+| `--hdmi-framerate FPS` | - | 要求fps（既定: `60`） |
+| `--hdmi-video-size WxH` | - | 入力解像度（既定: `1920x1080`） |
+| `--ffmpeg FILE` | - | FFmpegバイナリのパス（既定: `ffmpeg`） |
+| `--random-table FILE` | ※1 | 272バイトの参照表から11.3.0のGameKeyを算出 |
+| `--game-key HEX` | ※1 | 32桁の16進数GameKey文字列（プロセス引数に残るため注意） |
+| `--game-key-file FILE` | ※1 | 16バイトの生GameKeyバイナリファイル |
+| `--elf FILE` | `export-table` 必須 | 11.3.0 ELFバイナリからGameKeyを算出 |
+| `--pia-key-file FILE` | ※2 | 16バイトの生PiaKeyバイナリファイル（途中参加・復号用） |
+| `--peer IPv4` | ※2 | 手動指定したPiaKeyの通信相手SwitchのIPv4アドレス |
+| `--broadcast-ip IPv4` | - | ブロードキャストIPの自動推定値を上書き（Browse検証用） |
+| `--target-mac MAC` | 排他（※3） | 対象SwitchのMACアドレスを基準に送受信方向（`->` / `<-`）を表示 |
+| `--target-ip IPv4` | 排他（※3） | 対象SwitchのIPv4アドレスを基準に送受信方向を表示 |
+| `--mode MODE` | - | 出力モード（`normal` / `debug` / `salmon`、詳細は前述） |
+| `--details` | - | 全ビット範囲、復号HEXダンプ、WAVE先読みtickなどを追加表示 |
+| `--hide-cycle` | - | debugモード時に未対応のRTT要求や未確認Unreliableパケットを省略 |
+| `--visualizer-url URL` | - | InkScope VisualizerのWebSocketインジェストURL |
+| `--control-port PORT` | - | Visualizerからの鍵登録を受け付ける制御APIポート（`127.0.0.1`） |
+| `--jsonl` | - | 1行1JSON形式で全フィールドと送受信アドレスを出力 |
+| `-h`, `--help` | - | ヘルプメッセージを表示 |
 
-認証済み `CoopEnemySpawnNetEvent` のオオモノ ID 4〜14 には `BossRequestObservationOrder` を付けます。これは受信した**生成要求の行順**であり、再送などの重複は除外していません。要求座標が 11.3.0 の静的配置点に一意かつ近距離で一致したときだけ、内部の方向グループ・潮位の候補を `static position candidate` として表示します。配置点との一致は実際の敵の生成、現在座標、実行時の方向確定を意味しません。
+- **※1 鍵の指定要件**: `inspect` および通常 `capture` では、`--random-table`、`--game-key`、`--game-key-file`、`--elf` のうち**いずれか1つ**が必須です（`--control-port` 使用時は起動後のWeb登録が可能）。
+- **※2 途中参加時のPiaKey**: `--pia-key-file` と `--peer` は必ずペアで指定します。
+- **※3 送受信方向の基準**: `--target-mac` と `--target-ip` は併用できません。
 
-管理対象の `$HOME/.config/inkscope/pia_key.bin` を `capture` に `--pia-key-file` と `--peer` で渡すと、同じ部屋の途中からでも復号できます。保存鍵が対象相手の正しい形式のパケットを3件連続で認証できず、ほかの候補鍵でも認証できない場合は、ファイルが起動後に変更されていないことを確認して削除し、入り直しを案内します。新しい部屋の鍵を認証できた場合は 0600 で保存し直します。`inspect` は鍵ファイルを更新・削除しません。
-
-`PrivateSetting` の `StageId` は固定長文字列です。空文字はテキストでは `StageId=""` と表示し、JSONL では空文字のまま保持します。Random 選択との対応は画面操作と通信の照合に基づく解釈で、通信に数値 `-1` が入っているという意味ではありません。
-
-`capture` の外部ツールと権限は OS によって異なります。`--interface` には対象の **Ethernet** インターフェースを指定してください。PCAP リーダーは現在 Ethernet/IPv4/UDP のみ対応し、Linux の `any` やループバックなど別のリンク形式は解析できません。Unix の新規 PCAP は 0600 で作成し、Windows では保存先の ACL を引き継ぎます。
-
-| OS | 外部ツール | インターフェース一覧と権限 |
-| --- | --- | --- |
-| macOS | `/usr/sbin/tcpdump` | `ifconfig -l` で一覧表示。通常ユーザーでの取得には [ChmodBPF](https://formulae.brew.sh/cask/wireshark-chmodbpf) の初回設定が必要 |
-| Linux | `/usr/sbin/tcpdump` または `/usr/bin/tcpdump` | `tcpdump -D` で一覧表示。キャプチャ権限が必要。例えば tcpdump に必要な Linux capabilities を管理者が設定する |
-| Windows | `%ProgramFiles%\Wireshark\dumpcap.exe` または `%ProgramFiles(x86)%\Wireshark\dumpcap.exe` | `dumpcap -D` で一覧表示。Wireshark と Npcap のインストール、および Npcap で許可されたキャプチャ権限が必要。番号またはデバイス名を `--interface` に指定する。ポータブル版や別の場所へのインストールは現状検出しない |
-
-例えば Linux では `inkscope capture --interface eth0 --output capture.pcap --random-table table.bin`、Windows では `inkscope.exe capture --interface 1 --output capture.pcap --random-table table.bin` と実行できます。[Docker Desktop のホストネットワーク](https://docs.docker.com/engine/network/drivers/host/)は物理 NIC にパケット層でアクセスできず、distroless 実行イメージにもキャプチャツールはないため、Docker イメージは保存済み PCAP の `inspect` 用です。
-
-## WAVE 先読み
-
-OnlineCoopSetting から GameSeed を得ると、WAVE 0〜4 のイベントと潮位の**条件付き候補**を表示します。計算に使うステージなどの参照データは 11.3.0 由来で、他バージョンや実際に適用された結果との一致は未確認です。計算条件は[先読み crate](crates/ocean-calc/README.md)に記載しています。
+---
 
 ## プロトコル対応状況
 
-型名だけの行は本文を解析していません。意味フィールドまで完全に解析済みのプロトコルはまだありません。
+Piaプロトコル各層の解析状況です（型名のみ表示されるパケットは本文未デコードです）。
 
-| ID | プロトコル | 現在の解析 | 主な未解明部分 |
+| ID | プロトコル名 | 現在の解析状況 | 主な未解明・検証中フィールド |
 | ---: | --- | --- | --- |
-| 0 | Empty | 空の keepalive 形 | 別の形の有無 |
-| 1 | NetProtocol | 一部 subtype、Sequence、Generation、Reason、Detail | 残る subtype と本文 |
-| 2 | TurnProtocol | 型名 | 本文 |
-| 3 | RTTProtocol | 21 バイト形の Type、OriginTick、ElapsedMicroseconds、DestinationVariableId、ProtocolStationVariableId、対応する応答の CaptureResponseDelayMs | 他の形 |
-| 4 | SyncProtocol | 型名 | 本文 |
-| 5 | UnreliableProtocol | CoopSequenceNetState、CoopSeqPlayerNetState の一部 | 残る配列・Group |
-| 6 | CloneProtocol | 型名 | 本文 |
-| 7 | EventProtocol | 型名 | 本文 |
-| 8 | BroadcastEventProtocol | 観測済み 39 型の名前、7 型の本文の一部 | 残るイベント本文 |
-| 9 | ClockProtocol | 型名 | 本文 |
-| 10 | ReliableProtocol | 型名 | 本文 |
-| 11 | BroadcastReliableProtocol | 確認済み 78/161/226 バイト形の PrivateSetting、StageId、内部整数 Difficulty | 残る PrivateSetting 形式と本文 |
-| 12 | StreamBroadcastReliableProtocol | 型名 | 本文 |
-| 13 | SessionProtocol | subtype 番号 | subtype 本文 |
-| 14 | NatTraversalResultProtocol | 型名 | 本文 |
-| 15 | MonitoringDataProtocol | 型名 | 本文 |
-| 16 | WanNatTraversalProtocol | 型名 | 本文 |
-| 17 | Reckoning1DProtocol | 型名 | 本文 |
-| 18 | Reckoning3DProtocol | 型名 | 本文 |
+| 0 | `Empty` | 空のkeepaliveフレーム | 他のバリアントの有無 |
+| 1 | `NetProtocol` | 一部subtype、Sequence、Generation、Reason、Detail | 未対応subtypeおよび本文ペイロード |
+| 2 | `TurnProtocol` | 型名のみ識別 | 本文ペイロード |
+| 3 | `RTTProtocol` | 21バイト形（Type, OriginTick, ElapsedMicroseconds, VariableId, 応答遅延Ms） | 他のフレーム長バリアント |
+| 4 | `SyncProtocol` | 型名のみ識別 | 本文ペイロード |
+| 5 | `UnreliableProtocol` | `CoopSequenceNetState`, `CoopSeqPlayerNetState`（Group 1104/1107/1108） | 未知配列・内部フラグ |
+| 6 | `CloneProtocol` | 型名のみ識別 | 本文ペイロード |
+| 7 | `EventProtocol` | 型名のみ識別 | 本文ペイロード |
+| 8 | `BroadcastEventProtocol` | **観測済み39種類のイベント型**（アイテム生成・取得・納品、オオモノ生成等） | 残るイベントの本文構造 |
+| 9 | `ClockProtocol` | 型名のみ識別 | 本文ペイロード |
+| 10 | `ReliableProtocol` | 型名のみ識別 | 本文ペイロード |
+| 11 | `BroadcastReliableProtocol` | 78/161/226バイト形（`PrivateSetting`, `StageId`, 内部難易度） | 未知のPrivateSettingバリアント |
+| 12 | `StreamBroadcastReliableProtocol` | 型名のみ識別 | 本文ペイロード |
+| 13 | `SessionProtocol` | subtype番号の識別 | 各subtypeの内部ペイロード |
+| 14 | `NatTraversalResultProtocol` | 型名のみ識別 | 本文ペイロード |
+| 15 | `MonitoringDataProtocol` | 型名のみ識別 | 本文ペイロード |
+| 16 | `WanNatTraversalProtocol` | 型名のみ識別 | 本文ペイロード |
+| 17 | `Reckoning1DProtocol` | 型名のみ識別 | 本文ペイロード |
+| 18 | `Reckoning3DProtocol` | 型名のみ識別 | 本文ペイロード |
 
-ELF に登録された Coop 系イベント 54 種のうち、通信で型名を確認できたのは 16 種、本文の一部を解析できたのは 6 種です。入力は classic PCAP の Ethernet/IPv4/UDP、ライブ保存は macOS・Linux・Windows に対応します。
+### プレイヤー状態・座標に関する留意点
 
-.devcontainer と GitHub Actions は [qtmleap/devcontainers の Rust example](https://github.com/qtmleap/devcontainers/tree/789699a52c594e0a0015441c6d57c602f994dc9a/examples/rust)を基にしています。Docker の実行イメージは distroless です。データの由来は[DATA_NOTICE.md](DATA_NOTICE.md)を参照してください。
+- Protocol 5（Group 1107 / 1108）から抽出される `PlayerStateX/Y/Z` は、ELFの `PlayerNetState` エンコーダーとビット幅・位置が一致する三軸候補値ですが、画面上のプレイヤー枠（P1〜P4）やワールド座標への完全なマッピングは未確定です（`PlayerStateCoordinateMeaning=Unknown` として出力されます）。
+- `CoopEnemySpawnNetEvent` の `BossRequestObservationOrder` は受信した生成要求の順序であり、実際の出現成功や再送除外を意味するものではありません。
+
+---
+
+## OS別の実行要件
+
+ライブキャプチャにはOSごとのキャプチャツールと管理者/実行権限が必要です（Ethernet/IPv4/UDPパケットのみ対応）。
+
+| OS | 使用ツール | インターフェース確認方法と必要権限 |
+| --- | --- | --- |
+| **macOS** | `/usr/sbin/tcpdump` | `ifconfig -l`<br>一般ユーザーでの実行には [ChmodBPF](https://formulae.brew.sh/cask/wireshark-chmodbpf) のインストールとOS再起動が必要 |
+| **Linux** | `tcpdump` | `tcpdump -D`<br>実行ユーザーへのキャプチャ権限（Linux Capabilities 等）の付与が必要 |
+| **Windows** | `dumpcap.exe` | `dumpcap -D`<br>WiresharkおよびNpcapのインストールとキャプチャ権限が必要（`--interface` に番号またはデバイス名を指定） |
+
+> [!WARNING]
+> Dockerコンテナ（Docker Desktop）環境では物理NICへの直接パケットアクセスが制限されるため、Dockerイメージは保存済みPCAPの解析（`inspect`）専用となります。
+
+---
+
+## 関連ドキュメント・ライセンス
+
+- **WAVE先読みロジック**: [`crates/ocean-calc/README.md`](crates/ocean-calc/README.md)
+- **データの取り扱い基準**: [`DATA_NOTICE.md`](DATA_NOTICE.md)
+- **開発ガイドライン**: [`AGENTS.md`](AGENTS.md)
