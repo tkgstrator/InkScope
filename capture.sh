@@ -29,7 +29,7 @@ case $# in
 esac
 
 umask 077
-interface="${INKSCOPE_INTERFACE:-en18}"
+interface="${INKSCOPE_INTERFACE:-}"
 peer="${INKSCOPE_PEER:-192.168.1.180}"
 mode="${INKSCOPE_MODE:-normal}"
 if [[ $# -eq 2 ]]; then
@@ -42,6 +42,65 @@ visualizer_url="${INKSCOPE_VISUALIZER_URL:-ws://127.0.0.1:10252/api/ingest}"
 visualizer_token="${INKSCOPE_VISUALIZER_TOKEN:-}"
 control_token="${INKSCOPE_CONTROL_TOKEN:-}"
 control_port="${INKSCOPE_CONTROL_PORT:-10254}"
+
+# macOS: follow the peer's directly connected route, never an arbitrary active NIC.
+# Keep the override separate so every capture attempt can discover a new route.
+resolve_capture_interface() {
+    python3 - "$peer" "$interface" <<'PY'
+import ipaddress
+import re
+import subprocess
+import sys
+
+def read(command):
+    try:
+        return subprocess.run(command, check=True, capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(f"{command[0]} could not inspect the network ({type(error).__name__})") from None
+
+try:
+    peer = ipaddress.IPv4Address(sys.argv[1])
+    if peer.is_multicast or peer.is_unspecified or peer.is_loopback:
+        raise ValueError("INKSCOPE_PEER must be a unicast IPv4 address")
+    selected = sys.argv[2]
+    automatic = not selected
+    if automatic:
+        route = read(["route", "-n", "get", str(peer)])
+        candidates = re.findall(r"^\s*interface:\s*(\S+)\s*$", route, re.MULTILINE)
+        if len(candidates) != 1:
+            raise ValueError(f"no unique interface in the route to {peer}")
+        selected = candidates[0]
+        if not re.fullmatch(r"en[0-9]+", selected):
+            raise ValueError(f"route to {peer} uses a virtual or unsupported interface: {selected}")
+        flags = re.search(r"^\s*flags:\s*<([^>]+)>", route, re.MULTILINE)
+        if flags and "GATEWAY" in flags[1].split(","):
+            raise ValueError(f"route to {peer} goes through a gateway, not a directly connected LAN")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,63}", selected):
+        raise ValueError("INKSCOPE_INTERFACE contains an invalid interface name")
+    config = read(["ifconfig", selected])
+    flags = re.search(r"^" + re.escape(selected) + r":\s+flags=[^<]*<([^>]+)>", config, re.MULTILINE)
+    if not flags or not {"UP", "RUNNING"}.issubset(flags[1].split(",")):
+        raise ValueError(f"{selected} is not UP and RUNNING")
+    if not re.search(r"^\s*status:\s*active\s*$", config, re.MULTILINE):
+        raise ValueError(f"{selected} has no active link")
+    if automatic:
+        networks = []
+        for address, mask in re.findall(r"^\s*inet\s+(\S+)\s+netmask\s+(\S+)", config, re.MULTILINE):
+            if mask.startswith("0x"):
+                mask = str(ipaddress.IPv4Address(int(mask, 16)))
+            networks.append(ipaddress.IPv4Network(f"{address}/{mask}", strict=False))
+        if not any(peer in network for network in networks):
+            raise ValueError(f"{peer} is not on a directly connected IPv4 network of {selected}")
+    print(selected)
+except ValueError as error:
+    print(f"Capture interface unavailable: {error}. Check the LAN connection or set INKSCOPE_INTERFACE to an active capture device.", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+# Fail before building on first launch. Later selection failures only retry,
+# leaving a previously running owned capture intact.
+resolve_capture_interface >/dev/null || exit 1
 
 # The sibling Visualizer's private dotenv is the local default. Read only the
 # requested token, without executing the dotenv or printing the secret.
@@ -180,13 +239,17 @@ schedule_retry() {
 }
 
 start_capture() {
+    local selected_interface selection_mode="automatic route selection"
+    selected_interface="$(resolve_capture_interface)" || return 1
+    if [[ -n $interface ]]; then selection_mode="INKSCOPE_INTERFACE override"; fi
+    printf 'InkScope capture interface: %s (peer %s; %s)\n' "$selected_interface" "$peer" "$selection_mode" >&2
     capture_number=$((capture_number + 1))
     local stamp output size attempt old_pid
     stamp="$(date '+%Y%m%d-%H%M%S')"
     output="$capture_dir/inkscope-player-${stamp}-watch-$$-${capture_number}.pcap"
     printf 'Starting new InkScope capture: %s\n' "$output" >&2
     INKSCOPE_VISUALIZER_TOKEN="$visualizer_token" INKSCOPE_CONTROL_TOKEN="$control_token" \
-        "$repo_dir/target/debug/inkscope" capture --interface "$interface" \
+        "$repo_dir/target/debug/inkscope" capture --interface "$selected_interface" \
         --output "$output" --game-key-file "$game_key_file" \
         --pia-key-file "$pia_key_file" --peer "$peer" --mode "$mode" \
         "${visualizer_args[@]}" "${control_args[@]}" &

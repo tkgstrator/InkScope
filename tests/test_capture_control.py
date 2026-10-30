@@ -34,6 +34,12 @@ class CaptureControlTest(unittest.TestCase):
             cargo = root / "bin" / "cargo"
             cargo.write_text("#!/bin/sh\nexit 0\n")
             cargo.chmod(0o700)
+            route = root / "bin" / "route"
+            route.write_text("#!/bin/sh\nprintf 'interface: en13\\nflags: <UP,DONE,CLONING>\\n'\n")
+            route.chmod(0o700)
+            ifconfig = root / "bin" / "ifconfig"
+            ifconfig.write_text("#!/bin/sh\nprintf '%s: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\\n    inet 192.168.1.119 netmask 0xffffff00\\n    status: active\\n' \"$1\"\n")
+            ifconfig.chmod(0o700)
             fake = repo / "target" / "debug" / "inkscope"
             fake.write_text(
                 "#!/usr/bin/env python3\n"
@@ -53,10 +59,13 @@ class CaptureControlTest(unittest.TestCase):
                 "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
                 "INKSCOPE_CAPTURE_DIR": str(root / "captures"),
                 "INKSCOPE_GAME_KEY_FILE": str(game_key),
+                "INKSCOPE_PEER": "192.168.1.180",
+                "INKSCOPE_MODE": "normal",
                 "CAPTURE_TEST_REPORT": str(report),
             }
             env.pop("INKSCOPE_VISUALIZER_TOKEN", None)
             env.pop("INKSCOPE_CONTROL_TOKEN", None)
+            env.pop("INKSCOPE_INTERFACE", None)
             process = subprocess.Popen(
                 ["/bin/bash", str(repo / "capture.sh")], cwd=repo, env=env,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -75,6 +84,7 @@ class CaptureControlTest(unittest.TestCase):
                 )
                 args = invocation["args"]
                 self.assertEqual(args[args.index("--control-port") + 1], "10254")
+                self.assertEqual(args[args.index("--interface") + 1], "en13")
             finally:
                 if process.poll() is None:
                     process.send_signal(signal.SIGTERM)
