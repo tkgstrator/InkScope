@@ -61,7 +61,10 @@ impl Session {
     fn create(config: &Config, header: &[u8; 24], trigger_ns: u64) -> Result<Self> {
         std::fs::create_dir_all(&config.root).map_err(|e| format!("in-game root: {e}"))?;
         let path = config.root.join(uuid::Uuid::new_v4().to_string());
+        #[cfg(unix)]
         let mut builder = std::fs::DirBuilder::new();
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;

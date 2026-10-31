@@ -487,13 +487,15 @@ mod tests {
         drop(listener);
         let url = format!("ws://127.0.0.1:{}/api/ingest", address.port());
         let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        let connection = ConnectionState(Arc::new(AtomicU8::new(0)));
+        let worker_connection = connection.clone();
         let worker = std::thread::spawn(move || {
             sender_loop(
                 receiver,
                 url,
                 address,
                 "test-token".into(),
-                ConnectionState(Arc::new(AtomicU8::new(0))),
+                worker_connection,
                 false,
             )
         });
@@ -507,7 +509,15 @@ mod tests {
                 session_id: session_id.into(),
             })
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let failure_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while connection.label() != "degraded" {
+            assert!(
+                std::time::Instant::now() < failure_deadline,
+                "first connection attempt did not fail"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(RECONNECT_INTERVAL + std::time::Duration::from_millis(250));
         let listener = std::net::TcpListener::bind(address).unwrap();
         listener.set_nonblocking(true).unwrap();
         let server =
@@ -538,7 +548,6 @@ mod tests {
             }).to_string().into())).unwrap();
                 received["record"].clone()
             });
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         event["record"] = Value::String("2".into());
         sender
             .send(Outbound {
@@ -549,8 +558,8 @@ mod tests {
             .unwrap();
         drop(sender);
         let report = worker.join().unwrap();
+        assert_eq!(server.join().unwrap(), "2");
         assert_eq!(report.dropped, 1);
         assert_eq!(report.uncertain, 0);
-        assert_eq!(server.join().unwrap(), "2");
     }
 }

@@ -142,9 +142,11 @@ fn station_roster_extracts_only_the_exact_standalone_ten_entry_shape() {
         .find(|f| f.name == "StationRoster[3].StationConstant")
         .unwrap();
     assert_eq!(name.bits, Some([349, 413]));
-    assert!(fields.iter().all(|f| !["Npln", "Identifier", "Key", "Name"]
-        .iter()
-        .any(|s| f.name.contains(s))));
+    assert!(fields.iter().all(|f| {
+        !["Npln", "Identifier", "Key", "Name"]
+            .iter()
+            .any(|s| f.name.contains(s))
+    }));
 }
 
 #[test]
@@ -234,9 +236,11 @@ fn session_roster_normalizes_private_pairs_and_never_exports_session_names_or_ui
     );
     assert_eq!(get("SessionRoster[1].StationVariable"), Some("513"));
     assert_eq!(fields.len(), 6);
-    assert!(fields
-        .iter()
-        .all(|f| !f.name.contains("Name") && !f.name.contains("Uid")));
+    assert!(
+        fields
+            .iter()
+            .all(|f| !f.name.contains("Name") && !f.name.contains("Uid"))
+    );
     let field = fields
         .iter()
         .find(|f| f.name == "SessionRoster[1].StationConstant")
@@ -344,10 +348,11 @@ fn station_roster_authenticated_rows_keep_private_pairs_in_raw_fields_and_type_c
         assert_eq!(row.layout.as_deref(), Some("type_fields"));
         assert!(field_value(&row, scope).is_some());
         assert_eq!(field_value(&row, identity), Some("18364758544493064720"));
-        assert!(!row
-            .fields
-            .iter()
-            .any(|f| f.name.contains("Npln") || f.name.contains("Uid")));
+        assert!(
+            !row.fields
+                .iter()
+                .any(|f| f.name.contains("Npln") || f.name.contains("Uid"))
+        );
     }
 }
 
@@ -445,10 +450,11 @@ fn station_profile_dynamic_prefix_truncation_or_shift_rejects_the_chunk_atomical
         ));
         assert_eq!(field_value(&row, "ProfileScope"), None);
         assert_eq!(field_value(&row, "ProfileCount"), None);
-        assert!(!row
-            .fields
-            .iter()
-            .any(|field| field.name.starts_with("Profile[")));
+        assert!(
+            !row.fields
+                .iter()
+                .any(|field| field.name.starts_with("Profile["))
+        );
         assert_ne!(row.layout.as_deref(), Some("confirmed_fields"));
     }
 }
@@ -552,10 +558,11 @@ fn station_profile_chunk_is_atomic_for_malformed_or_truncated_supported_frames()
         let row = station_row(&station_payload(&frames, true));
         assert_eq!(field_value(&row, "ProfileScope"), None);
         assert_eq!(field_value(&row, "ProfileCount"), None);
-        assert!(!row
-            .fields
-            .iter()
-            .any(|field| field.name.starts_with("Profile[")));
+        assert!(
+            !row.fields
+                .iter()
+                .any(|field| field.name.starts_with("Profile["))
+        );
         assert_ne!(row.layout.as_deref(), Some("confirmed_fields"));
     }
     let mut payload = station_payload(&[good], true);
@@ -664,22 +671,26 @@ fn observed_ikura_scalars_require_the_complete_two_count_four_state_shape() {
     for (start, width, value) in [(1, 12, 221), (45, 1, 0), (72, 3, 3), (123, 3, 3)] {
         let mut malformed = payload.clone();
         set_bits(&mut malformed, start, width, value);
-        assert!(!semantic_fields(&Chunk {
-            protocol: 5,
-            port: Some(101),
-            payload: malformed
-        })
-        .iter()
-        .any(|field| matches!(field.name.as_str(), "IkuraNum" | "HeldGoldenIkuraNum")));
+        assert!(
+            !semantic_fields(&Chunk {
+                protocol: 5,
+                port: Some(101),
+                payload: malformed
+            })
+            .iter()
+            .any(|field| matches!(field.name.as_str(), "IkuraNum" | "HeldGoldenIkuraNum"))
+        );
     }
     payload.truncate(29);
-    assert!(!semantic_fields(&Chunk {
-        protocol: 5,
-        port: Some(101),
-        payload
-    })
-    .iter()
-    .any(|field| field.name == "IkuraNum"));
+    assert!(
+        !semantic_fields(&Chunk {
+            protocol: 5,
+            port: Some(101),
+            payload
+        })
+        .iter()
+        .any(|field| field.name == "IkuraNum")
+    );
 }
 
 #[test]
@@ -707,12 +718,14 @@ fn rescued_index_is_signed_and_requires_the_exact_known_footer() {
     for (start, width, value) in [(231, 1, 1), (56, 8, 1), (8, 16, 0)] {
         let mut malformed = payload.clone();
         set_bits(&mut malformed, start, width, value);
-        assert!(!semantic_fields(&Chunk {
-            protocol: 8,
-            port: Some(100),
-            payload: malformed
-        })
-        .iter()
-        .any(|field| field.name == "RescuerIndex"));
+        assert!(
+            !semantic_fields(&Chunk {
+                protocol: 8,
+                port: Some(100),
+                payload: malformed
+            })
+            .iter()
+            .any(|field| field.name == "RescuerIndex")
+        );
     }
 }

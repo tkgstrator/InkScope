@@ -144,7 +144,10 @@ fn prepare_screenshots_directory(path: &Path) -> Result<()> {
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
             let mut builder = fs::DirBuilder::new();
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt;

@@ -1,5 +1,4 @@
 use super::*;
-use std::time::{Duration, Instant};
 
 fn config() -> VideoConfig {
     VideoConfig {
@@ -72,8 +71,8 @@ fn ffmpeg_command_preserves_resolution_and_names_arrival_time_in_microseconds() 
             .any(|arg| matches!(arg.as_str(), "-r" | "-vf" | "-s"))
     );
     assert_eq!(
-        args.last().unwrap(),
-        "private/screeshots/segment-000007-%019d.png"
+        Path::new(args.last().unwrap()),
+        Path::new("private/screeshots").join("segment-000007-%019d.png")
     );
 }
 
